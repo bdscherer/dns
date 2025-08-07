@@ -1,0 +1,13 @@
+# FaithFilter Blocklist
+#
+# Add domains that you want to block at the DNS level.  Subdomains of a
+# listed domain are automatically blocked.  Lines beginning with '#' are
+# treated as comments and ignored.  Blank lines are also ignored.
+
+# Below are a few sample entries.  For a real deployment, you should
+# incorporate comprehensive adult-content blocklists from the open‑source
+# community.  See the README for suggestions on blocklist sources.
+
+exampleadult1.com
+exampleadult2.net
+exampleadult3.org

@@ -1,0 +1,17 @@
+dns:
+  listen_ip: "127.0.0.1"
+  listen_port: 5353
+  upstream_dns:
+    - "8.8.8.8"
+  forward_timeout: 5
+  safe_search: true
+  youtube_mode: "strict"
+logs:
+  query_log_file: "faithfilter/test_queries.log"
+  log_level: "DEBUG"
+blocklist:
+  file: "faithfilter/blocklist.txt"
+whitelist:
+  file: "faithfilter/whitelist.txt"
+http_api:
+  enable: false

@@ -1,0 +1,59 @@
+dns:
+  # IP address and port for the DNS service to listen on. "0.0.0.0" will listen
+  # on all network interfaces. Port 53 is the default DNS port and requires
+  # super‑user privileges. You can change it for testing or run the service
+  # with sudo for privileged ports.
+  listen_ip: "0.0.0.0"
+  listen_port: 53
+
+  # Upstream DNS servers used for forwarding queries that are not filtered.
+  # You can specify multiple entries for redundancy. These servers are only
+  # consulted when the domain is not on the blocklist or subject to a forced
+  # rewrite (SafeSearch/YouTube mode).
+  upstream_dns:
+    - "1.1.1.1"   # Cloudflare DNS (Anycast)
+    - "8.8.8.8"   # Google Public DNS (Anycast)
+
+  # Timeout in seconds when forwarding DNS queries to upstream servers.
+  forward_timeout: 5
+
+  # Enable or disable Google SafeSearch enforcement. When true, queries to
+  # google.com and related domains will return the SafeSearch VIP address.
+  safe_search: true
+
+  # Configure YouTube restriction mode. Accepted values:
+  #   "off"      – Do not rewrite YouTube domains.
+  #   "moderate" – Map YouTube domains to the moderate restricted IP (216.239.38.119).
+  #   "strict"  – Map YouTube domains to the strict restricted IP (216.239.38.120).
+  youtube_mode: "strict"
+
+logs:
+  # Path to the file where DNS queries will be appended. The parent directory
+  # should exist and be writable by the service user. This file can be
+  # consumed by the HTTP API for reporting.
+  query_log_file: "logs/queries.log"
+
+  # Logging level: DEBUG, INFO, WARNING, ERROR or CRITICAL. INFO is usually
+  # appropriate for production.
+  log_level: "INFO"
+
+blocklist:
+  # Location of the blocklist file. Each line should contain a domain to be
+  # blocked. Subdomains of a listed domain are also blocked. Empty lines and
+  # comments (#) are ignored.
+  file: "blocklist.txt"
+
+whitelist:
+  # Location of the whitelist file. Domains listed here will always be
+  # forwarded even if they appear on the blocklist. This is useful for
+  # overriding false positives. Format is the same as blocklist.txt.
+  file: "whitelist.txt"
+
+http_api:
+  # Whether to enable the built‑in HTTP API for management and reporting.
+  # The API provides endpoints for viewing logs, updating blocklists and
+  # whitelists, and checking service status. You can disable this by
+  # setting enable to false if you prefer to manage files manually.
+  enable: true
+  host: "0.0.0.0"
+  port: 5000

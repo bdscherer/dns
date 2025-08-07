@@ -1,0 +1,10 @@
+# FaithFilter Whitelist
+#
+# Domains listed in this file will always be resolved normally, even if they
+# appear in the blocklist.  Use the whitelist to override false positives or
+# allow specific domains that you trust.  Comments begin with '#' and are
+# ignored.
+
+# Example whitelisted domains:
+example-safe-site.com
+whitelistedsite.org
