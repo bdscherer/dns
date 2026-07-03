@@ -25,8 +25,32 @@ their DNS server and it will:
   mechanism for **any other service** that offers a restricted DNS entry
   point. IPv6 (AAAA) answers for rewritten domains are suppressed so the
   enforcement cannot be bypassed over IPv6.
-- **Manage everything over an optional HTTP API** — status, query log,
-  alerts, list management, keyword management, report preview/send.
+- **Resist bypass attempts** — a built-in blocklist of DNS-over-HTTPS
+  resolvers, VPNs and proxies (hits raise a `bypass_attempt` alert),
+  NXDOMAIN for the Firefox DoH and iCloud Private Relay canary domains,
+  and CNAME-cloaking detection that blocks domains whose CNAME chain leads
+  to a blocked tracker.
+- **Web dashboard** — password-protected (a password is auto-generated on
+  first run): live stats, recent queries and alerts, list and keyword
+  management, unblock requests, backup download, test e-mail. The JSON API
+  behind it requires the same login (or an `X-API-Key`).
+- **Per-device policies** — group devices by IP/CIDR; per group: full
+  filtering, monitor-only, or unfiltered; safe search on/off; and
+  **curfews** that block all internet access during set hours (may cross
+  midnight).
+- **Block page** — optionally answer blocked domains with a friendly
+  "site blocked" page including an unblock-request form (requests show up
+  on the dashboard and can e-mail you).
+- **Instant + failure alerts** — optional immediate e-mail when a device
+  hits adult content or a bypass service (throttled per device), a warning
+  when blocklist downloads keep failing, an optional service-start notice,
+  and a health section in every weekly report.
+- **Fast and outage-proof** — DNS responses are cached for their TTL and
+  served stale if every upstream is down; query and alert logs rotate by
+  size automatically.
+- **DNS-over-HTTPS / DNS-over-TLS service** — an RFC 8484 `/dns-query`
+  endpoint and an optional DoT listener (Android "Private DNS"), so phones
+  can keep using the filter even away from home (requires a certificate).
 
 ## Files
 
@@ -215,14 +239,25 @@ The restricted endpoint is resolved through your upstream DNS and cached;
 if resolution fails, the documented `fallback_ip` keeps enforcement
 working.
 
-## HTTP API
+## Dashboard and HTTP API
 
-Enable under `http_api:` (bind it to `127.0.0.1` or set `api_key`, which
-clients must send as an `X-API-Key` header).
+Browse to `http://<server>:5000` and sign in. The password comes from
+`http_api.password`, or — if left empty — is **auto-generated on first run**
+and stored in `admin_password.txt` next to the config (the log says where).
+Set `http_api.host: "0.0.0.0"` to reach the dashboard from other devices on
+your LAN.
+
+The dashboard shows live stats, recent queries and alerts, manages the
+blocklist/whitelist/keywords, lists unblock requests (one click to
+whitelist), downloads backups, refreshes sources and sends a test e-mail.
+
+The JSON API requires either a logged-in session or an `X-API-Key` header
+(`http_api.api_key`):
 
 | Endpoint | Method | Description |
 |---|---|---|
-| `/api/status` | GET | Stats, list sizes, active safe-search rules. |
+| `/api/status` | GET | Stats, list sizes, cache stats, refresh health. |
+| `/api/health` | GET | Plain-text health summary. |
 | `/api/queries?limit=N` | GET | Recent queries (time, client, domain, action). |
 | `/api/alerts?days=N` | GET | Monitoring alerts from the last N days (default 7). |
 | `/api/blocklist` | GET/POST | View personal blocklist / add `{"domain": ...}`. |
@@ -230,25 +265,64 @@ clients must send as an `X-API-Key` header).
 | `/api/whitelist` | GET/POST | Same, for the whitelist. |
 | `/api/whitelist/<domain>` | DELETE | Remove from whitelist. |
 | `/api/keywords` | GET/POST | View monitored keywords / add `{"keyword": ...}`. |
+| `/api/unblock-requests` | GET | Unblock requests submitted via the block page. |
 | `/api/reload` | POST | Reload local files (blocklist, whitelist, keywords). |
 | `/api/refresh` | POST | Re-download online sources now. |
 | `/api/report/preview` | GET | Plain-text preview of the pending weekly report. |
 | `/api/report/send` | POST | Send the report immediately. |
+| `/api/test-email` | POST | Send a test e-mail to verify SMTP settings. |
+| `/api/backup` | GET | Download config + lists as a zip. |
+| `/api/restore` | POST | Restore from a backup zip (multipart field `backup`). |
+| `/dns-query` | GET/POST | DNS-over-HTTPS (RFC 8484); no auth required. |
 
 ## How a query is handled
 
-1. **Whitelist** — whitelisted domains (and subdomains) bypass every filter
+1. **Device policy** — the client's group decides everything that follows:
+   `off` forwards immediately, `monitor_only` records but never blocks,
+   `full` (default) blocks and records. An active **curfew** blocks the
+   query outright.
+2. **Canaries** — `use-application-dns.net` and the iCloud Private Relay
+   hosts get NXDOMAIN so devices keep using this resolver.
+3. **Whitelist** — whitelisted domains (and subdomains) bypass every filter
    and are forwarded upstream.
-2. **Safe search** — queries for enforced services are answered with the
+4. **Safe search** — queries for enforced services are answered with the
    provider's restricted endpoint; AAAA queries return empty.
-3. **Blocklists** — personal list and all sources, with subdomain matching.
-   `adult`-category hits raise an alert; the client gets NXDOMAIN (or
-   `0.0.0.0` with `block_response: zero_ip`).
-4. **Keywords** — remaining domains are scanned for monitored keywords;
+5. **Blocklists** — personal list (plain domains, `*wildcards*` and
+   `/regex/` rules) and all sources, with subdomain matching. `adult` and
+   `bypass` hits raise alerts; the client gets NXDOMAIN, `0.0.0.0`, or the
+   block page depending on configuration.
+6. **Keywords** — remaining domains are scanned for monitored keywords;
    matches raise an alert and are optionally blocked.
-5. **Forward** — everything else goes to the upstream DNS servers.
+7. **Forward + CNAME check** — everything else is answered from the TTL
+   cache or the upstream servers (stale cache entries are served if all
+   upstreams are down), and responses whose CNAME chain leads to a blocked
+   domain are blocked.
 
-Every query is logged to `logs/queries.log`.
+Every query is logged to `logs/queries.log` (rotated by size).
+
+## Per-device policies, curfews and the block page
+
+Give the kids' devices DHCP reservations on your router, then group them:
+
+```yaml
+clients:
+  groups:
+    - name: "kids"
+      members: ["192.168.1.20", "192.168.1.21"]
+      filtering: "full"
+      safe_search: true
+      curfew:
+        - days: ["sun", "mon", "tue", "wed", "thu"]
+          from: "21:30"
+          to: "06:30"
+    - name: "parents"
+      members: ["192.168.1.10"]
+      filtering: "off"
+
+block_page:
+  enabled: true      # blocked sites show a "site blocked" page with an
+  port: 80           # unblock-request form instead of a dead connection
+```
 
 ## Running as a systemd service
 
@@ -285,11 +359,23 @@ dig @127.0.0.1 -p 5353 exampleadult1.com           # → NXDOMAIN
 dig @127.0.0.1 -p 5353 www.google.com              # → SafeSearch VIP
 ```
 
+## Installing as a service in one command
+
+```sh
+sudo ./faithfilter --install-service      # Linux: systemd unit, enabled + started
+faithfilter.exe --install-service        # Windows (admin): boot-time Scheduled Task
+```
+
 ## Notes and limitations
 
-- DNS filtering works per-network; devices on cellular data or using
-  hard-coded DoH resolvers bypass it. Combine with router firewall rules.
+- The bypass blocklist, canary NXDOMAINs and CNAME checks make evasion much
+  harder, but a determined user with a device you don't control can still
+  hard-code an IP or use cellular data. Router firewall rules that force
+  LAN port 53/853 through this server remain worthwhile.
 - Keyword scanning sees only *domain names*, not page content or search
   terms inside URLs.
-- The alert log and query log are plain files; rotate them with logrotate
-  if your network is busy.
+- The block page can't suppress the browser certificate warning on HTTPS
+  sites — that is inherent to DNS-level blocking.
+- Serving DoH/DoT to phones outside your network requires a public
+  hostname with a real TLS certificate (e.g. Let's Encrypt) and forwarding
+  the relevant ports; keep the dashboard itself off the public internet.

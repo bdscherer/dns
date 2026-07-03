@@ -23,7 +23,20 @@ dns:
   # How blocked domains are answered:
   #   "nxdomain" - respond that the domain does not exist (default)
   #   "zero_ip"  - respond with 0.0.0.0 / :: (some apps behave better)
+  # (When block_page.enabled is true, A queries answer with this server's
+  # address instead so browsers land on the explanation page.)
   block_response: "nxdomain"
+
+  # Block domains whose CNAME chain leads to a blocked domain (ad networks
+  # hide trackers behind innocent-looking first-party subdomains).
+  block_cname_cloaking: true
+
+  # Cache upstream answers for their TTL; serve_stale keeps the network
+  # working from cache when every upstream is unreachable.
+  cache:
+    enabled: true
+    max_entries: 20000
+    serve_stale: true
 
 # -----------------------------------------------------------------------------
 # Blocking: your own sites + subscribed blocklist sources
@@ -56,6 +69,14 @@ blocking:
       url: "https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts"
       enabled: true
 
+    # DoH resolvers, VPNs and proxies - blocking these stops devices from
+    # tunnelling their DNS around the filter. Hits raise a "bypass_attempt"
+    # alert in the weekly report.
+    - name: "bypass-doh-vpn-proxy"
+      category: "bypass"
+      url: "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/wildcard/doh-vpn-proxy-bypass-onlydomains.txt"
+      enabled: true
+
     # Additional examples (disabled by default):
     #- name: "gambling"
     #  category: "custom"
@@ -65,11 +86,64 @@ blocking:
     #  category: "custom"
     #  file: "/etc/faithfilter/office-blocklist.txt"
 
+  # Answer NXDOMAIN for browser/OS "canary" domains: turns off Firefox's
+  # built-in DNS-over-HTTPS and iCloud Private Relay so devices keep using
+  # this resolver.
+  block_doh_canary: true
+
   # Re-download online sources every N hours.
   refresh_hours: 24
 
   # Where downloaded lists are cached (survives restarts and outages).
   cache_dir: "lists_cache"
+
+# -----------------------------------------------------------------------------
+# Per-device policies: groups, filtering levels and curfews
+# -----------------------------------------------------------------------------
+clients:
+  # Devices are matched by IP or CIDR range (give them DHCP reservations on
+  # your router first). Clients in no group get full filtering with safe
+  # search and no curfew. Group settings:
+  #   filtering:   "full" (block + report), "monitor_only" (report only),
+  #                or "off" (no filtering at all)
+  #   safe_search: enforce safe search for this group (default true)
+  #   curfew:      windows when ALL internet access is blocked
+  #                (server-local time; windows may cross midnight)
+  groups: []
+  #  - name: "kids"
+  #    members: ["192.168.1.20", "192.168.1.21"]
+  #    filtering: "full"
+  #    safe_search: true
+  #    curfew:
+  #      - days: ["sun", "mon", "tue", "wed", "thu"]
+  #        from: "21:30"
+  #        to: "06:30"
+  #  - name: "parents"
+  #    members: ["192.168.1.10"]
+  #    filtering: "off"
+
+# -----------------------------------------------------------------------------
+# Block page: explain blocks in the browser and collect unblock requests
+# -----------------------------------------------------------------------------
+block_page:
+  # When enabled, blocked A queries answer with this server's IP and a small
+  # web server on `port` shows a "site blocked" page with an unblock-request
+  # form (requests appear on the dashboard and can trigger an e-mail).
+  # Note: HTTPS sites show a certificate warning before the page - that is
+  # inherent to DNS-level blocking.
+  enabled: false
+  port: 80
+  ip: ""                     # auto-detected when empty
+  unblock_requests_file: "logs/unblock_requests.jsonl"
+
+# -----------------------------------------------------------------------------
+# Notifications (uses the same SMTP account as the weekly report)
+# -----------------------------------------------------------------------------
+notifications:
+  instant_alerts: true          # e-mail when a device hits adult/bypass content
+  instant_min_minutes: 60       # at most one instant alert per device per hour
+  notify_on_start: false        # e-mail whenever the service (re)starts
+  refresh_failure_threshold: 3  # warn after N consecutive failed downloads
 
 # -----------------------------------------------------------------------------
 # Monitoring: what triggers an alert in the weekly report
@@ -149,11 +223,35 @@ email:
 logs:
   query_log_file: "logs/queries.log"
   log_level: "INFO"
+  max_log_mb: 20       # rotate query/alert logs beyond this size
+  log_backups: 3       # rotated copies to keep (.1, .2, ...)
 
+# -----------------------------------------------------------------------------
+# Dashboard, API and DNS-over-HTTPS
+# -----------------------------------------------------------------------------
 http_api:
   enable: true
-  host: "127.0.0.1"    # keep the API off the public internet
+  host: "127.0.0.1"    # use "0.0.0.0" to reach the dashboard from the LAN
   port: 5000
-  # Optional shared secret; when set, requests must send an
-  # "X-API-Key: <value>" header.
-  #api_key: "change-me"
+
+  # Dashboard password. Leave empty to auto-generate one on first run
+  # (stored in admin_password.txt next to the config, shown in the log).
+  password: ""
+
+  # Optional shared secret for scripts ("X-API-Key: <value>" header).
+  api_key: ""
+
+  # Serve DNS-over-HTTPS (RFC 8484) at /dns-query. Browsers and phones
+  # require HTTPS: set cert_file/key_file (e.g. from Let's Encrypt) or put
+  # the endpoint behind a TLS reverse proxy.
+  doh: true
+  cert_file: ""
+  key_file: ""
+
+# DNS-over-TLS listener for Android "Private DNS". Needs a certificate
+# matching the hostname configured on the phones.
+dot:
+  enabled: false
+  port: 853
+  cert_file: ""
+  key_file: ""

@@ -21,8 +21,9 @@ from dnslib.server import BaseResolver, DNSLogger, DNSServer
 
 import faithfilter
 from faithfilter import (
-    DEFAULT_CONFIG, AlertLog, BlocklistManager, FaithFilterResolver,
-    KeywordMonitor, build_report, deep_merge, parse_domain_lines,
+    DEFAULT_CONFIG, AlertLog, BlocklistManager, ClientPolicies, DNSCache,
+    FaithFilterResolver, KeywordMonitor, Notifier, Reporter, build_report,
+    create_api_server, deep_merge, parse_domain_lines, rotate_if_needed,
 )
 
 UPSTREAM_PORT = 15353
@@ -34,10 +35,21 @@ LOGGER = logging.getLogger("test")
 
 
 class FakeUpstream(BaseResolver):
-    """Answers every A query with UPSTREAM_IP."""
+    """Answers every A query with UPSTREAM_IP; 'cloaked.example' gets a
+    CNAME chain pointing at a blocked ad tracker."""
 
     def resolve(self, request, handler):
+        from dnslib import CNAME
         reply = request.reply()
+        qname = str(request.q.qname).rstrip(".").lower()
+        if qname == "cloaked.example" and request.q.qtype == QTYPE.A:
+            reply.add_answer(RR(rname=request.q.qname, rtype=QTYPE.CNAME,
+                                rclass=1, ttl=60,
+                                rdata=CNAME("tracker.adnetwork.example")))
+            reply.add_answer(RR(rname="tracker.adnetwork.example",
+                                rtype=QTYPE.A, rclass=1, ttl=60,
+                                rdata=A(UPSTREAM_IP)))
+            return reply
         if request.q.qtype == QTYPE.A:
             reply.add_answer(RR(rname=request.q.qname, rtype=QTYPE.A,
                                 rclass=1, ttl=60, rdata=A(UPSTREAM_IP)))
@@ -93,7 +105,7 @@ class DefaultConfigTests(unittest.TestCase):
                             {"blocking": {"sources": []}})
         self.assertEqual(merged["blocking"]["sources"], [])
         # and the original defaults are untouched
-        self.assertEqual(len(DEFAULT_CONFIG["blocking"]["sources"]), 2)
+        self.assertEqual(len(DEFAULT_CONFIG["blocking"]["sources"]), 3)
 
     def test_defaults_build_a_working_resolver(self):
         # The built-in configuration alone (no config file, no downloaded
@@ -176,6 +188,105 @@ class AlertLogTests(unittest.TestCase):
             shutil.rmtree(tmp)
 
 
+class UnitTests(unittest.TestCase):
+    def test_rotate_if_needed(self):
+        tmp = tempfile.mkdtemp()
+        try:
+            path = os.path.join(tmp, "x.log")
+            with open(path, "w") as f:
+                f.write("A" * 100)
+            rotate_if_needed(path, max_bytes=50, backups=2)
+            self.assertTrue(os.path.exists(path + ".1"))
+            self.assertFalse(os.path.exists(path))
+        finally:
+            shutil.rmtree(tmp)
+
+    def test_dns_cache_fresh_and_stale(self):
+        cache = DNSCache(max_entries=10)
+        request = faithfilter.DNSRecord.question("cached.example", "A")
+        response = request.reply()
+        response.add_answer(RR(rname=request.q.qname, rtype=QTYPE.A,
+                               rclass=1, ttl=60, rdata=A("1.2.3.4")))
+        self.assertIsNone(cache.get(request))
+        cache.put(request, response)
+        hit = cache.get(request)
+        self.assertIsNotNone(hit)
+        self.assertEqual(str(hit.rr[0].rdata), "1.2.3.4")
+        # Force expiry: fresh lookups miss, stale lookups still serve.
+        key = ("cached.example.", QTYPE.A)
+        packed, _, stale_until = cache._store[key]
+        cache._store[key] = (packed, 0, stale_until)
+        self.assertIsNone(cache.get(request))
+        self.assertIsNotNone(cache.get(request, allow_stale=True))
+
+    def test_client_policies_group_matching(self):
+        policies = ClientPolicies({"clients": {"groups": [
+            {"name": "kids", "members": ["10.0.0.5", "10.0.1.0/24"],
+             "filtering": "full"},
+            {"name": "parents", "members": ["10.0.0.9"], "filtering": "off"},
+        ]}}, LOGGER)
+        self.assertEqual(policies.group_for("10.0.0.5")["name"], "kids")
+        self.assertEqual(policies.group_for("10.0.1.77")["name"], "kids")
+        self.assertEqual(policies.group_for("10.0.0.9")["name"], "parents")
+        self.assertEqual(policies.group_for("10.0.2.1")["name"], "default")
+        self.assertEqual(policies.group_for("garbage")["name"], "default")
+
+    def test_curfew_windows_including_midnight(self):
+        group = {"curfew": [{"days": ["mon"], "from": "21:30", "to": "06:30"}]}
+        monday_22 = datetime.datetime(2026, 6, 29, 22, 0)     # Monday
+        monday_20 = datetime.datetime(2026, 6, 29, 20, 0)
+        tuesday_5 = datetime.datetime(2026, 6, 30, 5, 0)      # after midnight
+        tuesday_12 = datetime.datetime(2026, 6, 30, 12, 0)
+        self.assertTrue(ClientPolicies.curfew_active(group, monday_22))
+        self.assertFalse(ClientPolicies.curfew_active(group, monday_20))
+        self.assertTrue(ClientPolicies.curfew_active(group, tuesday_5))
+        self.assertFalse(ClientPolicies.curfew_active(group, tuesday_12))
+
+    def test_personal_blocklist_patterns(self):
+        tmp = tempfile.mkdtemp()
+        try:
+            bl = os.path.join(tmp, "bl.txt")
+            with open(bl, "w") as f:
+                f.write("*tiktok*\n/^bad[0-9]+\\.com$/\nplain.example\n")
+            mgr = BlocklistManager({"blocking": {
+                "my_blocklist": bl,
+                "whitelist": os.path.join(tmp, "none.txt"),
+                "cache_dir": tmp, "sources": []}}, LOGGER)
+            self.assertEqual(mgr.blocked_category("www.tiktok.com"), "custom")
+            self.assertEqual(mgr.blocked_category("bad123.com"), "custom")
+            self.assertEqual(mgr.blocked_category("plain.example"), "custom")
+            self.assertIsNone(mgr.blocked_category("harmless.org"))
+        finally:
+            shutil.rmtree(tmp)
+
+    def test_notifier_throttling(self):
+        sent = []
+
+        class Recording(Notifier):
+            def send(self, subject, body):
+                sent.append(subject)
+                return True
+
+        notifier = Recording({"email": {"enabled": True}}, LOGGER)
+        self.assertTrue(notifier.send_throttled("k", 60, "first", "b"))
+        self.assertFalse(notifier.send_throttled("k", 60, "second", "b"))
+        self.assertTrue(notifier.send_throttled("other", 60, "third", "b"))
+        self.assertEqual(sent, ["first", "third"])
+
+    def test_report_includes_health_text(self):
+        tmp = tempfile.mkdtemp()
+        try:
+            alerts = AlertLog(os.path.join(tmp, "a.jsonl"), LOGGER)
+            reporter = Reporter(
+                {"email": {"state_file": os.path.join(tmp, "s.json")}},
+                alerts, LOGGER, health_text=lambda: "Filter health:\n  OK")
+            body, count = reporter.build_body()
+            self.assertEqual(count, 0)
+            self.assertIn("Filter health:", body)
+        finally:
+            shutil.rmtree(tmp)
+
+
 class EndToEndTests(unittest.TestCase):
     """Full resolver behind a UDP socket, forwarding to a fake upstream."""
 
@@ -198,6 +309,10 @@ class EndToEndTests(unittest.TestCase):
             f.write("0.0.0.0 nasty-adult-site.example\n")
         with open(path("ads.txt"), "w") as f:
             f.write("0.0.0.0 tracker.adnetwork.example\n")
+        with open(path("bypass.txt"), "w") as f:
+            f.write("sneaky-vpn.example\n")
+        with open(path("config.yaml"), "w") as f:
+            f.write("# test config marker\n")
 
         cls.config = {
             "dns": {
@@ -215,8 +330,12 @@ class EndToEndTests(unittest.TestCase):
                 "sources": [
                     {"name": "adult", "category": "adult", "file": path("adult.txt")},
                     {"name": "ads", "category": "ads", "file": path("ads.txt")},
+                    {"name": "bypass", "category": "bypass", "file": path("bypass.txt")},
                 ],
             },
+            "_config_path": path("config.yaml"),
+            "http_api": {"password": "test-password",
+                         "password_file": path("admin_password.txt")},
             "monitoring": {
                 "extra_keywords": ["forbiddenword"],
                 "alert_log_file": path("alerts.jsonl"),
@@ -331,6 +450,107 @@ class EndToEndTests(unittest.TestCase):
         alerts = self.resolver.alerts.read_since(now - datetime.timedelta(minutes=5))
         text = build_report(alerts, now - datetime.timedelta(days=7), now)
         self.assertIn("nasty-adult-site.example", text)
+
+    def test_doh_canary_returns_nxdomain(self):
+        for name in ("use-application-dns.net", "mask.icloud.com"):
+            reply = query(name)
+            self.assertEqual(reply.header.rcode, RCODE.NXDOMAIN, name)
+
+    def test_bypass_domain_blocked_and_alerted(self):
+        reply = query("client3.sneaky-vpn.example")
+        self.assertEqual(reply.header.rcode, RCODE.NXDOMAIN)
+        alerts = self.resolver.alerts.read_since(
+            datetime.datetime.now(datetime.timezone.utc)
+            - datetime.timedelta(minutes=5))
+        self.assertTrue(any(a["reason"] == "bypass_attempt" for a in alerts))
+
+    def test_cname_cloaking_blocked(self):
+        # cloaked.example itself is unlisted, but the fake upstream answers
+        # it with a CNAME to a blocked ad tracker.
+        reply = query("cloaked.example")
+        self.assertEqual(reply.header.rcode, RCODE.NXDOMAIN)
+
+    def test_cache_serves_repeat_queries(self):
+        before = self.resolver.cache.stats()["hits"]
+        query("cache-me.example")
+        query("cache-me.example")
+        self.assertGreater(self.resolver.cache.stats()["hits"], before)
+
+
+class ApiTests(unittest.TestCase):
+    """Dashboard auth, DoH endpoint and backup, via the Flask test client."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.mkdtemp()
+
+        def path(name):
+            return os.path.join(cls.tmp, name)
+
+        with open(path("blocklist.txt"), "w") as f:
+            f.write("mybadsite.com\n")
+        with open(path("config.yaml"), "w") as f:
+            f.write("# marker\n")
+        cls.config = {
+            "dns": {"upstream_dns": [], "forward_timeout": 1},
+            "blocking": {"my_blocklist": path("blocklist.txt"),
+                         "whitelist": path("whitelist.txt"),
+                         "cache_dir": path("cache"), "sources": []},
+            "monitoring": {"alert_log_file": path("alerts.jsonl")},
+            "logs": {"query_log_file": None},
+            "_config_path": path("config.yaml"),
+            "http_api": {"password": "test-password",
+                         "password_file": path("admin_password.txt")},
+        }
+        resolver = FaithFilterResolver(cls.config, LOGGER)
+        reporter = Reporter(cls.config, resolver.alerts, LOGGER)
+        cls.app = create_api_server(resolver, reporter, cls.config,
+                                    None, LOGGER)
+
+    @classmethod
+    def tearDownClass(cls):
+        shutil.rmtree(cls.tmp)
+
+    def setUp(self):
+        # Fresh (unauthenticated) session per test.
+        self.client = self.app.test_client()
+
+    def login(self):
+        return self.client.post("/login", data={"password": "test-password"})
+
+    def test_api_requires_auth(self):
+        self.assertEqual(self.client.get("/api/status").status_code, 401)
+        response = self.client.get("/")
+        self.assertEqual(response.status_code, 302)   # redirect to /login
+
+    def test_wrong_password_rejected(self):
+        response = self.client.post("/login", data={"password": "nope"})
+        self.assertEqual(response.status_code, 401)
+
+    def test_login_grants_access(self):
+        self.assertEqual(self.login().status_code, 302)
+        self.assertEqual(self.client.get("/api/status").status_code, 200)
+        page = self.client.get("/")
+        self.assertIn(b"FaithFilter dashboard", page.data)
+
+    def test_doh_endpoint_is_open_and_filters(self):
+        wire = faithfilter.DNSRecord.question("mybadsite.com", "A").pack()
+        encoded = __import__("base64").urlsafe_b64encode(wire).decode().rstrip("=")
+        response = self.client.get(f"/dns-query?dns={encoded}")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.content_type, "application/dns-message")
+        reply = faithfilter.DNSRecord.parse(response.data)
+        self.assertEqual(reply.header.rcode, RCODE.NXDOMAIN)
+
+    def test_backup_returns_zip_with_lists(self):
+        import zipfile as zf_mod
+        self.login()
+        response = self.client.get("/api/backup")
+        self.assertEqual(response.status_code, 200)
+        with zf_mod.ZipFile(__import__("io").BytesIO(response.data)) as zf:
+            names = set(zf.namelist())
+        self.assertIn("blocklist.txt", names)
+        self.assertIn("config.yaml", names)
 
 
 if __name__ == "__main__":
