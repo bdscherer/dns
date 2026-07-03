@@ -1,0 +1,11 @@
+# FaithFilter monitored keywords
+#
+# Any DNS query for a domain containing one of these keywords is recorded
+# and included in the weekly e-mail report. One keyword per line; lines
+# starting with '#' are ignored. A built-in list of adult keywords is
+# always active in addition to this file (see config.yaml -> monitoring).
+#
+# Examples:
+#casino
+#gambling
+#vape
