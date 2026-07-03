@@ -61,17 +61,29 @@ for tagged releases (`git tag v1.0 && git push --tags`), from the
 **Releases** page. Each artifact contains the executable plus template
 `config.yaml`, `blocklist.txt`, `whitelist.txt` and `keywords.txt`.
 
-The executable behaves exactly like the script and defaults to the
-`config.yaml` sitting next to it, so `--config` is optional:
+**The executable is fully self-contained — no configuration files are
+required.** All defaults (adult + ads blocklists, safe search, YouTube
+strict, localhost API) are built in, and on first run it creates its own
+`blocklist.txt`, `whitelist.txt` and `keywords.txt` next to itself:
 
 ```sh
 sudo ./faithfilter                 # Linux
 faithfilter.exe                    # Windows (run as Administrator)
 ```
 
-Relative paths inside the config (logs, lists, cache) are resolved against
-the config file's folder, so everything stays in the install directory even
-when launched as a service.
+To configure e-mail reports and other personal settings, run the built-in
+wizard once — it asks a few questions and writes a minimal `config.yaml`
+for you:
+
+```sh
+sudo ./faithfilter --setup         # or: faithfilter.exe --setup
+```
+
+If a `config.yaml` exists next to the executable it is merged over the
+built-in defaults, so it only ever needs to contain the settings you
+changed (the repository's `config.yaml` documents every available option).
+Relative paths resolve against the executable's folder, so everything stays
+in the install directory even when launched as a service.
 
 To build one yourself instead (must be built on the OS you target —
 PyInstaller does not cross-compile):
@@ -84,7 +96,8 @@ pyinstaller --onefile --name faithfilter faithfilter.py
 
 ### Running the EXE on Windows
 
-1. Extract the zip to `C:\FaithFilter` and edit `config.yaml`.
+1. Extract the zip to `C:\FaithFilter` and (optionally) run
+   `faithfilter.exe --setup` in a terminal to configure e-mail reports.
 2. Port 53 must be free: if the **Internet Connection Sharing (ICS)**
    service is running, stop and disable it (`services.msc`).
 3. Allow DNS through the firewall (admin prompt):
@@ -113,7 +126,10 @@ and requires root to bind.
 
 ## Configuration overview
 
-`config.yaml` is fully commented; the highlights:
+Every setting has a built-in default (see `DEFAULT_CONFIG` in
+`faithfilter.py`), so `config.yaml` is optional and only needs the keys you
+want to change. The repository's `config.yaml` is a fully commented
+reference of every option; the highlights:
 
 ### Blocking individual sites
 

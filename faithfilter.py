@@ -30,7 +30,9 @@ Requires the packages in requirements.txt (dnslib, Flask, PyYAML).
 """
 
 import argparse
+import copy
 import datetime
+import getpass
 import hashlib
 import json
 import logging
@@ -55,6 +57,96 @@ try:
     from flask import Flask, jsonify, request
 except ImportError:  # pragma: no cover
     Flask = None  # type: ignore
+
+
+# ---------------------------------------------------------------------------
+# Built-in default configuration
+# ---------------------------------------------------------------------------
+#
+# The program is fully usable with no configuration file at all: these
+# defaults enable adult-content and ad blocking, all safe-search
+# enforcement, and the management API on localhost.  A config.yaml placed
+# next to the program (or passed with --config) is deep-merged over these
+# defaults, so it only needs to contain the settings being changed.
+
+DEFAULT_CONFIG: Dict = {
+    "dns": {
+        "listen_ip": "0.0.0.0",
+        "listen_port": 53,
+        "listen_tcp": True,
+        "upstream_dns": ["1.1.1.1", "8.8.8.8"],
+        "forward_timeout": 5,
+        "block_response": "nxdomain",
+    },
+    "blocking": {
+        "my_blocklist": "blocklist.txt",
+        "whitelist": "whitelist.txt",
+        "sources": [
+            {"name": "adult-content", "category": "adult",
+             "url": "https://raw.githubusercontent.com/StevenBlack/hosts/"
+                    "master/alternates/porn-only/hosts"},
+            {"name": "ads-and-trackers", "category": "ads",
+             "url": "https://raw.githubusercontent.com/StevenBlack/hosts/"
+                    "master/hosts"},
+        ],
+        "refresh_hours": 24,
+        "cache_dir": "lists_cache",
+    },
+    "monitoring": {
+        "adult_keywords_enabled": True,
+        "extra_keywords": [],
+        "keywords_file": "keywords.txt",
+        "keyword_exceptions": [],
+        "block_keyword_matches": False,
+        "alert_log_file": "logs/alerts.jsonl",
+    },
+    "safe_search": {
+        "google": True,
+        "bing": True,
+        "duckduckgo": True,
+        "youtube": "strict",
+        "custom_rewrites": [],
+    },
+    "email": {
+        "enabled": False,
+        "smtp_host": "smtp.gmail.com",
+        "smtp_port": 587,
+        "use_tls": True,
+        "use_ssl": False,
+        "username": "",
+        "password_env": "FAITHFILTER_SMTP_PASSWORD",
+        "from": "",
+        "to": [],
+        "report_day": "sunday",
+        "report_hour": 8,
+        "send_if_empty": True,
+        "state_file": "logs/report_state.json",
+    },
+    "logs": {
+        "query_log_file": "logs/queries.log",
+        "log_level": "INFO",
+    },
+    "http_api": {
+        "enable": True,
+        "host": "127.0.0.1",
+        "port": 5000,
+    },
+}
+
+
+def deep_merge(base: Dict, override: Dict) -> Dict:
+    """Merge ``override`` into a copy of ``base``.
+
+    Dictionaries merge recursively; lists and scalars in the override
+    replace the base value entirely.
+    """
+    merged = copy.deepcopy(base)
+    for key, value in (override or {}).items():
+        if isinstance(value, dict) and isinstance(merged.get(key), dict):
+            merged[key] = deep_merge(merged[key], value)
+        else:
+            merged[key] = copy.deepcopy(value)
+    return merged
 
 
 # ---------------------------------------------------------------------------
@@ -1031,6 +1123,100 @@ def resolve_config_paths(config: Dict, base: str) -> None:
     fix(config.setdefault("logs", {}), "query_log_file")
 
 
+DATA_FILE_HEADERS = {
+    "my_blocklist": "# FaithFilter personal blocklist - one domain per line.\n"
+                    "# Subdomains of listed domains are blocked automatically.\n",
+    "whitelist": "# FaithFilter whitelist - these domains always resolve,\n"
+                 "# overriding every blocklist. One domain per line.\n",
+    "keywords_file": "# FaithFilter monitored keywords - one per line. Any queried\n"
+                     "# domain containing a keyword is recorded in the weekly report.\n",
+}
+
+
+def ensure_data_files(config: Dict, logger: logging.Logger) -> None:
+    """Create starter blocklist/whitelist/keywords files on first run."""
+    paths = {
+        "my_blocklist": config.get("blocking", {}).get("my_blocklist"),
+        "whitelist": config.get("blocking", {}).get("whitelist"),
+        "keywords_file": config.get("monitoring", {}).get("keywords_file"),
+    }
+    for kind, path in paths.items():
+        if not path or os.path.exists(path):
+            continue
+        try:
+            if os.path.dirname(path):
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(DATA_FILE_HEADERS[kind])
+            logger.info("Created starter file %s", path)
+        except OSError as exc:
+            logger.warning("Could not create %s: %s", path, exc)
+
+
+def run_setup(config_path: str) -> None:
+    """Interactive first-run wizard: writes a minimal config.yaml holding
+    only the answers, everything else stays on built-in defaults."""
+
+    def ask(prompt: str, default: str = "") -> str:
+        suffix = f" [{default}]" if default else ""
+        answer = input(f"{prompt}{suffix}: ").strip()
+        return answer or default
+
+    def ask_yes_no(prompt: str, default: bool = True) -> bool:
+        answer = ask(prompt + (" (Y/n)" if default else " (y/N)"))
+        if not answer:
+            return default
+        return answer.lower().startswith("y")
+
+    print("FaithFilter setup")
+    print("=" * 40)
+    print("Blocking, monitoring and safe-search are enabled by default;")
+    print("this wizard only configures the settings that need your input.\n")
+
+    overrides: Dict = {}
+
+    if ask_yes_no("Enable the weekly e-mail report?"):
+        email: Dict = {"enabled": True}
+        email["username"] = ask("Your e-mail address (SMTP login)")
+        email["smtp_host"] = ask("SMTP server", "smtp.gmail.com")
+        email["smtp_port"] = int(ask("SMTP port", "587"))
+        print("For Gmail, create an App Password at "
+              "https://myaccount.google.com/apppasswords")
+        password = getpass.getpass("SMTP password / app password "
+                                   "(stored in config.yaml): ").strip()
+        if password:
+            email["password"] = password
+        email["from"] = f"FaithFilter <{email['username']}>"
+        email["to"] = [ask("Send the report to", email["username"])]
+        email["report_day"] = ask("Report day", "sunday").lower()
+        email["report_hour"] = int(ask("Report hour (0-23, UTC)", "8"))
+        overrides["email"] = email
+    print()
+
+    youtube = ask("YouTube restricted mode - off, moderate or strict",
+                  "strict").lower()
+    if youtube != "strict":
+        overrides.setdefault("safe_search", {})["youtube"] = youtube
+
+    keywords = ask("Extra keywords to monitor (comma-separated, optional)")
+    if keywords:
+        overrides.setdefault("monitoring", {})["extra_keywords"] = [
+            k.strip().lower() for k in keywords.split(",") if k.strip()]
+    if ask_yes_no("Block keyword matches too (instead of only reporting)?",
+                  default=False):
+        overrides.setdefault("monitoring", {})["block_keyword_matches"] = True
+
+    with open(config_path, "w", encoding="utf-8") as f:
+        f.write("# FaithFilter settings - created by --setup.\n"
+                "# Only overrides are stored here; every other option uses the\n"
+                "# built-in defaults (see README.md for the full reference).\n")
+        yaml.safe_dump(overrides, f, default_flow_style=False, sort_keys=False)
+    if os.name == "posix":
+        os.chmod(config_path, 0o600)  # the file may hold the SMTP password
+    print(f"\nSettings saved to {config_path}")
+    print("Start the server now with the same command minus --setup.")
+
+
 def start_dns_server(resolver: FaithFilterResolver, config: Dict) -> List[DNSServer]:
     listen_ip = config.get("dns", {}).get("listen_ip", "0.0.0.0")
     listen_port = int(config.get("dns", {}).get("listen_port", 53))
@@ -1053,20 +1239,33 @@ def main() -> None:
                              "(default: config.yaml next to the program)")
     parser.add_argument("--send-report", action="store_true",
                         help="Send the weekly report immediately and exit")
+    parser.add_argument("--setup", action="store_true",
+                        help="Run the interactive setup wizard and exit")
     args = parser.parse_args()
 
     config_path = args.config or os.path.join(app_dir(), "config.yaml")
-    if not os.path.exists(config_path):
+    if args.setup:
+        run_setup(config_path)
+        return
+
+    user_config: Dict = {}
+    if os.path.exists(config_path):
+        with open(config_path, "r", encoding="utf-8") as f:
+            user_config = yaml.safe_load(f) or {}
+    elif args.config:
+        # An explicitly named file that doesn't exist is an error; the
+        # implicit default just means "run with built-in settings".
         parser.error(f"configuration file not found: {config_path}")
-    with open(config_path, "r", encoding="utf-8") as f:
-        config = yaml.safe_load(f) or {}
-    resolve_config_paths(config, os.path.dirname(os.path.abspath(config_path)))
+    config = deep_merge(DEFAULT_CONFIG, user_config)
+    resolve_config_paths(config, os.path.dirname(os.path.abspath(config_path))
+                         or app_dir())
 
     log_level_name = config.get("logs", {}).get("log_level", "INFO")
     logging.basicConfig(level=getattr(logging, log_level_name.upper(), logging.INFO),
                         format="%(asctime)s [%(levelname)s] %(message)s")
     logger = logging.getLogger("FaithFilter")
 
+    ensure_data_files(config, logger)
     resolver = FaithFilterResolver(config, logger)
     reporter = Reporter(config, resolver.alerts, logger)
 

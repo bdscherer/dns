@@ -21,8 +21,8 @@ from dnslib.server import BaseResolver, DNSLogger, DNSServer
 
 import faithfilter
 from faithfilter import (
-    AlertLog, BlocklistManager, FaithFilterResolver, KeywordMonitor,
-    build_report, parse_domain_lines,
+    DEFAULT_CONFIG, AlertLog, BlocklistManager, FaithFilterResolver,
+    KeywordMonitor, build_report, deep_merge, parse_domain_lines,
 )
 
 UPSTREAM_PORT = 15353
@@ -75,6 +75,45 @@ class ParserTests(unittest.TestCase):
             "plain-domain.com", "hosts-style.com",
             "also-hosts.net", "extra-hosts.org",
         })
+
+
+class DefaultConfigTests(unittest.TestCase):
+    def test_deep_merge_overrides_nested_scalars(self):
+        merged = deep_merge(DEFAULT_CONFIG, {
+            "dns": {"listen_port": 5353},
+            "email": {"enabled": True, "username": "me@example.com"},
+        })
+        self.assertEqual(merged["dns"]["listen_port"], 5353)
+        self.assertEqual(merged["dns"]["listen_ip"], "0.0.0.0")   # kept
+        self.assertTrue(merged["email"]["enabled"])
+        self.assertEqual(merged["email"]["smtp_host"], "smtp.gmail.com")
+
+    def test_deep_merge_replaces_lists(self):
+        merged = deep_merge(DEFAULT_CONFIG,
+                            {"blocking": {"sources": []}})
+        self.assertEqual(merged["blocking"]["sources"], [])
+        # and the original defaults are untouched
+        self.assertEqual(len(DEFAULT_CONFIG["blocking"]["sources"]), 2)
+
+    def test_defaults_build_a_working_resolver(self):
+        # The built-in configuration alone (no config file, no downloaded
+        # lists) must construct a resolver with all safe-search rules on.
+        tmp = tempfile.mkdtemp()
+        try:
+            cfg = deep_merge(DEFAULT_CONFIG, {
+                "blocking": {"my_blocklist": os.path.join(tmp, "b.txt"),
+                             "whitelist": os.path.join(tmp, "w.txt"),
+                             "cache_dir": os.path.join(tmp, "cache")},
+                "monitoring": {"keywords_file": None,
+                               "alert_log_file": os.path.join(tmp, "a.jsonl")},
+                "logs": {"query_log_file": None},
+            })
+            resolver = FaithFilterResolver(cfg, LOGGER)
+            labels = [r["label"] for r in resolver.safe_search.rules]
+            self.assertEqual(labels, ["google", "bing", "duckduckgo",
+                                      "youtube_strict"])
+        finally:
+            shutil.rmtree(tmp)
 
 
 class KeywordTests(unittest.TestCase):
