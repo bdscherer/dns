@@ -38,6 +38,7 @@ import os
 import re
 import smtplib
 import socket
+import sys
 import threading
 import time
 import urllib.request
@@ -995,6 +996,41 @@ def create_api_server(resolver: FaithFilterResolver, reporter: Reporter,
 # Entry point
 # ---------------------------------------------------------------------------
 
+def app_dir() -> str:
+    """Directory containing the program: next to the executable when frozen
+    into a standalone binary (PyInstaller), else next to this script."""
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(os.path.abspath(sys.executable))
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+def resolve_config_paths(config: Dict, base: str) -> None:
+    """Anchor relative paths in the config to the config file's directory.
+
+    Services (systemd, NSSM, Task Scheduler) often start with an unrelated
+    working directory; without this, logs and lists would land there.
+    """
+    def fix(d: Dict, key: str) -> None:
+        value = d.get(key)
+        if isinstance(value, str) and value and not os.path.isabs(value):
+            d[key] = os.path.join(base, value)
+
+    blocking = config.setdefault("blocking", {})
+    fix(blocking, "my_blocklist")
+    fix(blocking, "whitelist")
+    fix(blocking, "cache_dir")
+    for source in blocking.get("sources", []) or []:
+        fix(source, "file")
+    # Legacy top-level keys from old configs.
+    fix(config.get("blocklist", {}) or {}, "file")
+    fix(config.get("whitelist", {}) or {}, "file")
+    monitoring = config.setdefault("monitoring", {})
+    fix(monitoring, "keywords_file")
+    fix(monitoring, "alert_log_file")
+    fix(config.setdefault("email", {}), "state_file")
+    fix(config.setdefault("logs", {}), "query_log_file")
+
+
 def start_dns_server(resolver: FaithFilterResolver, config: Dict) -> List[DNSServer]:
     listen_ip = config.get("dns", {}).get("listen_ip", "0.0.0.0")
     listen_port = int(config.get("dns", {}).get("listen_port", 53))
@@ -1012,13 +1048,19 @@ def start_dns_server(resolver: FaithFilterResolver, config: Dict) -> List[DNSSer
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="FaithFilter DNS filtering service")
-    parser.add_argument("--config", required=True, help="Path to YAML configuration file")
+    parser.add_argument("--config", default=None,
+                        help="Path to YAML configuration file "
+                             "(default: config.yaml next to the program)")
     parser.add_argument("--send-report", action="store_true",
                         help="Send the weekly report immediately and exit")
     args = parser.parse_args()
 
-    with open(args.config, "r", encoding="utf-8") as f:
+    config_path = args.config or os.path.join(app_dir(), "config.yaml")
+    if not os.path.exists(config_path):
+        parser.error(f"configuration file not found: {config_path}")
+    with open(config_path, "r", encoding="utf-8") as f:
         config = yaml.safe_load(f) or {}
+    resolve_config_paths(config, os.path.dirname(os.path.abspath(config_path)))
 
     log_level_name = config.get("logs", {}).get("log_level", "INFO")
     logging.basicConfig(level=getattr(logging, log_level_name.upper(), logging.INFO),

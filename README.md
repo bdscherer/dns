@@ -51,6 +51,56 @@ pip3 install -r requirements.txt
 sudo python3 faithfilter.py --config config.yaml
 ```
 
+## Standalone executable (no Python required)
+
+Every push to `main` builds self-contained executables via GitHub Actions
+(`.github/workflows/build.yml`): `faithfilter.exe` for Windows,
+`faithfilter` for Linux x64 and Linux ARM64 (Raspberry Pi 64-bit OS).
+Download them from the repository's **Actions** tab (workflow artifacts) or,
+for tagged releases (`git tag v1.0 && git push --tags`), from the
+**Releases** page. Each artifact contains the executable plus template
+`config.yaml`, `blocklist.txt`, `whitelist.txt` and `keywords.txt`.
+
+The executable behaves exactly like the script and defaults to the
+`config.yaml` sitting next to it, so `--config` is optional:
+
+```sh
+sudo ./faithfilter                 # Linux
+faithfilter.exe                    # Windows (run as Administrator)
+```
+
+Relative paths inside the config (logs, lists, cache) are resolved against
+the config file's folder, so everything stays in the install directory even
+when launched as a service.
+
+To build one yourself instead (must be built on the OS you target —
+PyInstaller does not cross-compile):
+
+```sh
+pip3 install -r requirements.txt pyinstaller
+pyinstaller --onefile --name faithfilter faithfilter.py
+# result: dist/faithfilter (or dist\faithfilter.exe on Windows)
+```
+
+### Running the EXE on Windows
+
+1. Extract the zip to `C:\FaithFilter` and edit `config.yaml`.
+2. Port 53 must be free: if the **Internet Connection Sharing (ICS)**
+   service is running, stop and disable it (`services.msc`).
+3. Allow DNS through the firewall (admin prompt):
+   ```bat
+   netsh advfirewall firewall add rule name="FaithFilter DNS UDP" dir=in action=allow protocol=UDP localport=53
+   netsh advfirewall firewall add rule name="FaithFilter DNS TCP" dir=in action=allow protocol=TCP localport=53
+   ```
+4. Test by double-clicking `faithfilter.exe` (or run it in an
+   Administrator terminal to see the log output).
+5. To run it permanently as a Windows service, use
+   [NSSM](https://nssm.cc/): `nssm install FaithFilter C:\FaithFilter\faithfilter.exe`,
+   then in the NSSM dialog set the startup directory to `C:\FaithFilter`
+   and add `FAITHFILTER_SMTP_PASSWORD=<app password>` under
+   *Environment* (or put a literal `password:` in `config.yaml` and
+   restrict the file's permissions).
+
 Then set your router's DHCP DNS option (or each device's DNS server) to the
 machine running FaithFilter. Port 53 must be reachable from your clients
 and requires root to bind.
