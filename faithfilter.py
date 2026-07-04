@@ -63,7 +63,7 @@ import yaml
 from dnslib import A, AAAA, DNSRecord, QTYPE, RCODE, RR
 from dnslib.server import BaseResolver, DNSLogger, DNSServer
 
-__version__ = "2.1.0"
+__version__ = "2.2.0"
 
 try:
     # Flask is optional; the service still runs in DNS-only mode when the
@@ -168,6 +168,31 @@ DEFAULT_CONFIG: Dict = {
         "alert_log_file": "logs/alerts.jsonl",
         # Alerts and unblock requests older than this are purged daily.
         "alert_retention_days": 90,
+    },
+    "accountability": {
+        # Turn the filter into an accountability tool: each person's activity
+        # is summarised and e-mailed to their chosen accountability partners
+        # (allies), and partners get instant alerts + tamper notices.
+        #
+        #   people:
+        #     - name: "Sam"
+        #       devices: ["192.168.1.30", "192.168.1.31"]
+        #       allies: ["mentor@example.com", "spouse@example.com"]
+        #       self_report: false
+        "enabled": False,
+        "people": [],
+        # A device with no DNS activity for this long is flagged as possibly
+        # bypassing the filter (or simply off) in the report.
+        "dark_device_hours": 48,
+        "audit_log_file": "logs/audit.jsonl",
+        "search_log_file": "logs/searches.jsonl",
+    },
+    "extension": {
+        # Optional browser extension that reports search terms and visited
+        # URLs (the piece DNS can't see) to /api/extension/events. Give the
+        # extension this key; each install is tagged with a client IP.
+        "enabled": False,
+        "key": "",
     },
     "safe_search": {
         "google": True,
@@ -730,13 +755,15 @@ class Notifier:
             return os.environ[env]
         return self.cfg.get("password", "")
 
-    def send(self, subject: str, body: str) -> bool:
+    def send(self, subject: str, body: str,
+             recipients: Optional[List[str]] = None) -> bool:
         if not self.enabled:
             return False
         msg = EmailMessage()
         msg["Subject"] = subject
         msg["From"] = self.cfg.get("from") or self.cfg.get("username", "faithfilter@localhost")
-        recipients = self.cfg.get("to", [])
+        if recipients is None:
+            recipients = self.cfg.get("to", [])
         if isinstance(recipients, str):
             recipients = [recipients]
         if not recipients:
@@ -763,14 +790,15 @@ class Notifier:
             return False
 
     def send_throttled(self, key: str, min_interval_seconds: float,
-                       subject: str, body: str) -> bool:
+                       subject: str, body: str,
+                       recipients: Optional[List[str]] = None) -> bool:
         """Send unless a mail with the same key went out too recently."""
         now = time.time()
         with self._lock:
             if now - self._last.get(key, 0) < min_interval_seconds:
                 return False
             self._last[key] = now
-        return self.send(subject, body)
+        return self.send(subject, body, recipients)
 
 
 # ---------------------------------------------------------------------------
@@ -1037,7 +1065,15 @@ class StatsDB:
             " day TEXT NOT NULL, client TEXT NOT NULL, kind TEXT NOT NULL,"
             " count INTEGER NOT NULL DEFAULT 0,"
             " PRIMARY KEY (day, client, kind))")
+        # Hour-of-day activity for the accountability report (late-night
+        # patterns are themselves a signal).
+        self._db.execute(
+            "CREATE TABLE IF NOT EXISTS hourly ("
+            " day TEXT NOT NULL, client TEXT NOT NULL, hour INTEGER NOT NULL,"
+            " count INTEGER NOT NULL DEFAULT 0,"
+            " PRIMARY KEY (day, client, hour))")
         self._db.commit()
+        self._pending_hourly: Dict[Tuple[str, str, int], int] = {}
         if flush_interval > 0:
             threading.Thread(target=self._flush_loop, args=(flush_interval,),
                              name="stats-flush", daemon=True).start()
@@ -1051,7 +1087,8 @@ class StatsDB:
         return None
 
     def record(self, client: str, action: str) -> None:
-        day = datetime.date.today().isoformat()
+        now = datetime.datetime.now()
+        day = now.date().isoformat()
         with self._lock:
             self._pending[(day, client, "total")] = \
                 self._pending.get((day, client, "total"), 0) + 1
@@ -1059,11 +1096,14 @@ class StatsDB:
             if kind:
                 self._pending[(day, client, kind)] = \
                     self._pending.get((day, client, kind), 0) + 1
+            hkey = (day, client, now.hour)
+            self._pending_hourly[hkey] = self._pending_hourly.get(hkey, 0) + 1
 
     def flush(self) -> None:
         with self._lock:
             pending, self._pending = self._pending, {}
-            if not pending:
+            hourly, self._pending_hourly = self._pending_hourly, {}
+            if not pending and not hourly:
                 return
             try:
                 for (day, client, kind), count in pending.items():
@@ -1073,6 +1113,13 @@ class StatsDB:
                         "ON CONFLICT(day, client, kind) "
                         "DO UPDATE SET count = count + excluded.count",
                         (day, client, kind, count))
+                for (day, client, hour), count in hourly.items():
+                    self._db.execute(
+                        "INSERT INTO hourly (day, client, hour, count) "
+                        "VALUES (?, ?, ?, ?) "
+                        "ON CONFLICT(day, client, hour) "
+                        "DO UPDATE SET count = count + excluded.count",
+                        (day, client, hour, count))
                 self._db.commit()
             except sqlite3.Error as exc:
                 self.logger.error("Stats flush failed: %s", exc)
@@ -1109,16 +1156,267 @@ class StatsDB:
                 (start.isoformat(), end.isoformat())).fetchall()
         return {kind: total or 0 for kind, total in rows}
 
+    def totals_for_clients(self, clients: List[str], start: datetime.date,
+                           end: datetime.date) -> Dict[str, int]:
+        """Summed counters for a set of devices over [start, end)."""
+        if not clients:
+            return {}
+        self.flush()
+        placeholders = ",".join("?" * len(clients))
+        with self._lock:
+            rows = self._db.execute(
+                f"SELECT kind, SUM(count) FROM stats "
+                f"WHERE day >= ? AND day < ? AND client IN ({placeholders}) "
+                f"GROUP BY kind",
+                [start.isoformat(), end.isoformat(), *clients]).fetchall()
+        return {kind: total or 0 for kind, total in rows}
+
+    def hourly_pattern(self, clients: List[str], start: datetime.date,
+                       end: datetime.date) -> List[int]:
+        """24-slot activity histogram for a set of devices over [start, end)."""
+        pattern = [0] * 24
+        if not clients:
+            return pattern
+        self.flush()
+        placeholders = ",".join("?" * len(clients))
+        with self._lock:
+            rows = self._db.execute(
+                f"SELECT hour, SUM(count) FROM hourly "
+                f"WHERE day >= ? AND day < ? AND client IN ({placeholders}) "
+                f"GROUP BY hour",
+                [start.isoformat(), end.isoformat(), *clients]).fetchall()
+        for hour, total in rows:
+            if 0 <= hour < 24:
+                pattern[hour] = total or 0
+        return pattern
+
+    def last_seen(self, clients: List[str]) -> Dict[str, Optional[str]]:
+        """Most recent active day per device (None if never seen)."""
+        result: Dict[str, Optional[str]] = {c: None for c in clients}
+        if not clients:
+            return result
+        self.flush()
+        placeholders = ",".join("?" * len(clients))
+        with self._lock:
+            rows = self._db.execute(
+                f"SELECT client, MAX(day) FROM stats "
+                f"WHERE client IN ({placeholders}) GROUP BY client",
+                list(clients)).fetchall()
+        for client, day in rows:
+            result[client] = day
+        return result
+
     def purge(self, retention_days: int) -> None:
         cutoff = (datetime.date.today()
                   - datetime.timedelta(days=retention_days)).isoformat()
         with self._lock:
             self._db.execute("DELETE FROM stats WHERE day < ?", (cutoff,))
+            self._db.execute("DELETE FROM hourly WHERE day < ?", (cutoff,))
             self._db.commit()
 
     def stop(self) -> None:
         self._stop.set()
         self.flush()
+
+
+# ---------------------------------------------------------------------------
+# Content categories (for accountability reporting)
+# ---------------------------------------------------------------------------
+
+# Maps a report category to substrings found in the domain name.  This is a
+# best-effort classifier layered on top of the blocklist categories so the
+# accountability report can say *what kind* of content was requested, not
+# just "blocked".  Ordered by priority (first match wins).
+CATEGORY_KEYWORDS: List[Tuple[str, Tuple[str, ...]]] = [
+    ("adult", ("porn", "xxx", "sex", "nude", "naked", "hentai", "milf",
+               "erotic", "escort", "camgirl", "onlyfans", "xvideo",
+               "xhamster", "redtube", "fetish", "nsfw", "adult")),
+    ("dating", ("tinder", "bumble", "grindr", "okcupid", "match.com",
+                "hookup", "ashleymadison", "adultfriend")),
+    ("gambling", ("casino", "poker", "bet365", "betting", "gambl", "slots",
+                  "wager", "sportsbook", "draftkings", "fanduel")),
+    ("violence", ("gore", "liveleak", "bestgore")),
+    ("social", ("facebook", "instagram", "tiktok", "snapchat", "twitter",
+                "x.com", "reddit", "discord", "tumblr", "9gag")),
+    ("streaming", ("youtube", "netflix", "hulu", "twitch", "disneyplus",
+                   "primevideo", "hbomax")),
+    ("gaming", ("steampowered", "roblox", "epicgames", "minecraft",
+                "leagueoflegends", "battle.net", "xbox", "playstation")),
+]
+
+
+def classify_domain(domain: str, blocklist_category: Optional[str] = None) -> str:
+    """Return a report category for a domain.
+
+    A blocklist category of ``adult``/``bypass`` wins outright; otherwise the
+    domain name is matched against CATEGORY_KEYWORDS; failing that the
+    blocklist category (e.g. ``ads``) or ``other`` is used.
+    """
+    if blocklist_category == "adult":
+        return "adult"
+    if blocklist_category == "bypass":
+        return "bypass"
+    lowered = domain.lower()
+    for category, needles in CATEGORY_KEYWORDS:
+        if any(n in lowered for n in needles):
+            return category
+    if blocklist_category and blocklist_category not in ("custom",):
+        return blocklist_category
+    return "other"
+
+
+# ---------------------------------------------------------------------------
+# Audit log (tamper-evidence for accountability)
+# ---------------------------------------------------------------------------
+
+class AuditLog:
+    """Records changes that weaken filtering, so an accountability partner
+    can see if protections were paused, whitelisted or bypassed."""
+
+    def __init__(self, path: str, logger: logging.Logger,
+                 max_bytes: int = 5 * 1024 * 1024, backups: int = 3):
+        self.path = path
+        self.logger = logger
+        self.max_bytes = max_bytes
+        self.backups = backups
+        self._lock = threading.Lock()
+
+    def add(self, event: str, detail: str, client: str = "",
+            actor: str = "") -> None:
+        entry = {
+            "time": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            "event": event,      # e.g. "override_pause", "whitelist_add"
+            "detail": detail,
+            "client": client,
+            "actor": actor,
+        }
+        try:
+            if os.path.dirname(self.path):
+                os.makedirs(os.path.dirname(self.path), exist_ok=True)
+            with self._lock:
+                rotate_if_needed(self.path, self.max_bytes, self.backups)
+                with open(self.path, "a", encoding="utf-8") as f:
+                    f.write(json.dumps(entry) + "\n")
+        except OSError as exc:
+            self.logger.error("Could not write audit log: %s", exc)
+
+    def read_since(self, since: datetime.datetime) -> List[Dict]:
+        entries: List[Dict] = []
+        if not os.path.exists(self.path):
+            return entries
+        with open(self.path, "r", encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                try:
+                    entry = json.loads(line)
+                    ts = datetime.datetime.fromisoformat(entry["time"])
+                except (ValueError, KeyError):
+                    continue
+                if ts >= since:
+                    entries.append(entry)
+        return entries
+
+
+# ---------------------------------------------------------------------------
+# Search / URL log (fed by the browser extension)
+# ---------------------------------------------------------------------------
+
+class SearchLog:
+    """Stores browser search terms and visited URLs reported by the optional
+    extension — the piece DNS alone cannot see."""
+
+    def __init__(self, path: str, logger: logging.Logger, keywords=None,
+                 max_bytes: int = 20 * 1024 * 1024, backups: int = 3):
+        self.path = path
+        self.logger = logger
+        self.keywords = [k.lower() for k in (keywords or [])]
+        self.max_bytes = max_bytes
+        self.backups = backups
+        self._lock = threading.Lock()
+
+    def add(self, client: str, kind: str, engine: str, query: str,
+            url: str = "") -> Dict:
+        flagged = any(k in query.lower() for k in self.keywords)
+        entry = {
+            "time": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            "client": client,
+            "kind": kind,          # "search" | "visit"
+            "engine": engine,
+            "query": query[:300],
+            "url": url[:500],
+            "flagged": flagged,
+        }
+        try:
+            if os.path.dirname(self.path):
+                os.makedirs(os.path.dirname(self.path), exist_ok=True)
+            with self._lock:
+                rotate_if_needed(self.path, self.max_bytes, self.backups)
+                with open(self.path, "a", encoding="utf-8") as f:
+                    f.write(json.dumps(entry) + "\n")
+        except OSError as exc:
+            self.logger.error("Could not write search log: %s", exc)
+        return entry
+
+    def read_since(self, since: datetime.datetime,
+                   clients: Optional[List[str]] = None) -> List[Dict]:
+        entries: List[Dict] = []
+        if not os.path.exists(self.path):
+            return entries
+        with open(self.path, "r", encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                try:
+                    entry = json.loads(line)
+                    ts = datetime.datetime.fromisoformat(entry["time"])
+                except (ValueError, KeyError):
+                    continue
+                if ts >= since and (clients is None
+                                    or entry.get("client") in clients):
+                    entries.append(entry)
+        return entries
+
+
+# ---------------------------------------------------------------------------
+# Accountability: people, their devices, and their allies
+# ---------------------------------------------------------------------------
+
+class Person:
+    def __init__(self, spec: Dict):
+        self.name = str(spec.get("name", "Unknown"))
+        self.devices = [str(d) for d in (spec.get("devices") or [])]
+        allies = spec.get("allies") or []
+        self.allies = [allies] if isinstance(allies, str) else [str(a) for a in allies]
+        self.self_report = bool(spec.get("self_report", False))
+
+
+class Accountability:
+    """Loads the people/allies model and builds per-person reports."""
+
+    def __init__(self, config: Dict, logger: logging.Logger):
+        cfg = config.get("accountability", {})
+        self.enabled = bool(cfg.get("enabled", False))
+        self.logger = logger
+        self.dark_after_hours = float(cfg.get("dark_device_hours", 48))
+        self.people = [Person(p) for p in (cfg.get("people") or [])]
+
+    def person_for(self, client_ip: str) -> Optional[Person]:
+        for person in self.people:
+            if client_ip in person.devices:
+                return person
+        return None
+
+    @staticmethod
+    def _clean_streak_days(person_alerts: List[Dict]) -> int:
+        """Consecutive days up to today with no adult/bypass alerts."""
+        bad_days = set()
+        for alert in person_alerts:
+            if alert.get("reason") in ("adult_domain", "bypass_attempt"):
+                bad_days.add(alert["time"][:10])
+        streak = 0
+        day = datetime.date.today()
+        # Cap at a year so a fresh install doesn't claim an implausible run.
+        while day.isoformat() not in bad_days and streak < 365:
+            streak += 1
+            day -= datetime.timedelta(days=1)
+        return streak
 
 
 # ---------------------------------------------------------------------------
@@ -1565,6 +1863,14 @@ class FaithFilterResolver(BaseResolver):
                                    logger)
         self.notifier = Notifier(config, logger)
         self.notifications = config.get("notifications", {})
+        # Accountability layer (people/allies, audit trail, search log).
+        self.accountability = Accountability(config, logger)
+        acct_cfg = config.get("accountability", {})
+        self.audit = AuditLog(acct_cfg.get("audit_log_file",
+                                           "logs/audit.jsonl"), logger)
+        self.search_log = SearchLog(
+            acct_cfg.get("search_log_file", "logs/searches.jsonl"), logger,
+            keywords=self.keywords.keywords)
         self.blocklists.on_refresh_failure = self._refresh_failure_alert
         cache_cfg = config.get("dns", {}).get("cache", {})
         self.cache: Optional[DNSCache] = None
@@ -1718,6 +2024,16 @@ class FaithFilterResolver(BaseResolver):
                 f"({reason}: {detail}).\n\n"
                 "Further attempts from this device within the next hour are "
                 "throttled; the weekly report will contain the full list.")
+            # Notify the person's accountability partners directly.
+            person = self.accountability.person_for(client_ip)
+            if person and person.allies:
+                self.notifier.send_throttled(
+                    f"ally:{person.name}:{reason}", interval,
+                    f"Accountability alert for {person.name}",
+                    f"{person.name} ({label}) attempted to access {kind}:\n"
+                    f"  {domain}\n\nThis is an automated accountability alert. "
+                    "The full weekly report will follow.",
+                    recipients=person.allies)
 
     def _cname_blocked(self, response: DNSRecord) -> Optional[str]:
         """Category if a CNAME in the response chains to a blocked domain
@@ -1922,6 +2238,127 @@ def build_report(alerts: List[Dict], period_start: datetime.datetime,
     return "\n".join(lines)
 
 
+def _sparkline(pattern: List[int]) -> str:
+    """Render a 24-hour activity histogram as a compact text sparkline."""
+    blocks = " ▁▂▃▄▅▆▇█"
+    peak = max(pattern) or 1
+    out = "".join(blocks[min(8, (v * 8 + peak - 1) // peak)] for v in pattern)
+    return out
+
+
+def build_accountability_report(
+        person: "Person", alerts: List[Dict], searches: List[Dict],
+        audit: List[Dict], period_start: datetime.datetime,
+        period_end: datetime.datetime, streak_days: int,
+        hourly: Optional[List[int]] = None,
+        dark_devices: Optional[List[str]] = None,
+        blocklist_lookup: Optional[Callable[[str], Optional[str]]] = None) -> str:
+    """Render one person's accountability report for their allies.
+
+    This is the heart of the "rival to Covenant Eyes" product: it turns raw
+    DNS activity into an accountability partner's briefing — category
+    breakdown, time-of-day pattern, clean streak, evasion attempts, search
+    terms (from the browser extension), and tamper events.
+    """
+    adult = [a for a in alerts if a.get("reason") == "adult_domain"]
+    bypass = [a for a in alerts if a.get("reason") == "bypass_attempt"]
+    keyword = [a for a in alerts if a.get("reason") == "keyword"]
+    needs_convo = bool(adult or bypass
+                       or any(e.get("event", "").startswith("override")
+                              for e in audit)
+                       or dark_devices)
+
+    lines = [
+        f"FaithFilter accountability report for {person.name}",
+        f"Period: {period_start:%Y-%m-%d} to {period_end:%Y-%m-%d}",
+        "",
+        f"Clean streak: {streak_days} day(s) with no flagged activity.",
+        f"Status: {'NEEDS A CONVERSATION' if needs_convo else 'All clear'}",
+        "",
+    ]
+
+    # Highlights first — the part an ally reads in 10 seconds.
+    highlights: List[str] = []
+    if adult:
+        highlights.append(f"- {len(adult)} adult-content request(s)")
+    if bypass:
+        highlights.append(f"- {len(bypass)} attempt(s) to use a VPN/proxy/"
+                          "encrypted DNS (bypassing the filter)")
+    for event in audit:
+        if event.get("event", "").startswith("override"):
+            highlights.append(f"- Filtering was changed: {event.get('detail')}")
+    for device in (dark_devices or []):
+        highlights.append(f"- Device {device} went quiet — it may be off or "
+                          "bypassing the filter")
+    if highlights:
+        lines.append("Highlights:")
+        lines.extend(highlights)
+        lines.append("")
+
+    # Category breakdown across all flagged/blocked activity.
+    categories: Dict[str, int] = {}
+    for a in alerts:
+        cat = classify_domain(a.get("domain", ""),
+                              blocklist_lookup(a["domain"])
+                              if blocklist_lookup else None)
+        categories[cat] = categories.get(cat, 0) + 1
+    if categories:
+        lines.append("Activity by category:")
+        for cat, count in sorted(categories.items(), key=lambda kv: -kv[1]):
+            lines.append(f"  {cat:<12} {count}")
+        lines.append("")
+
+    if hourly and any(hourly):
+        lines.append("Activity by hour (00 -> 23):")
+        lines.append("  " + _sparkline(hourly))
+        late = sum(hourly[0:5])
+        if late:
+            lines.append(f"  Note: {late} request(s) between midnight and 5am.")
+        lines.append("")
+
+    if adult:
+        by_domain: Dict[str, int] = {}
+        for a in adult:
+            by_domain[a["domain"]] = by_domain.get(a["domain"], 0) + 1
+        lines.append("Adult / adult-adjacent domains:")
+        for domain, count in sorted(by_domain.items(), key=lambda kv: -kv[1])[:20]:
+            lines.append(f"  {domain:<45} {count}x")
+        lines.append("")
+
+    if searches:
+        lines.append(f"Search terms seen ({len(searches)}; from the browser "
+                     "extension):")
+        for s in searches[:40]:
+            flag = " (!)" if s.get("flagged") else ""
+            lines.append(f"  {s.get('time', '')[:16]} [{s.get('engine', '?')}] "
+                         f"{s.get('query', '')}{flag}")
+        lines.append("")
+
+    if bypass:
+        by_b: Dict[str, int] = {}
+        for a in bypass:
+            by_b[a["domain"]] = by_b.get(a["domain"], 0) + 1
+        lines.append("Filter-bypass services requested:")
+        for domain, count in sorted(by_b.items(), key=lambda kv: -kv[1])[:20]:
+            lines.append(f"  {domain:<45} {count}x")
+        lines.append("")
+
+    if audit:
+        lines.append("Filter change history (tamper log):")
+        for event in audit[-30:]:
+            lines.append(f"  {event.get('time', '')[:16]} "
+                         f"{event.get('event')}: {event.get('detail')}")
+        lines.append("")
+
+    if not (adult or bypass or keyword or searches):
+        lines.append("No flagged web activity this period. Keep it up!")
+
+    lines.append("")
+    lines.append("You are receiving this because you are an accountability "
+                 f"partner for {person.name}.")
+    return "\n".join(lines)
+
+
 class Reporter:
     """Sends the weekly alert summary over SMTP on a schedule."""
 
@@ -1929,7 +2366,8 @@ class Reporter:
                  notifier: Optional[Notifier] = None,
                  health_text: Optional[Callable[[], str]] = None,
                  names: Optional[Dict[str, str]] = None,
-                 statsdb: Optional[StatsDB] = None):
+                 statsdb: Optional[StatsDB] = None,
+                 resolver: Optional["FaithFilterResolver"] = None):
         self.cfg = config.get("email", {})
         self.alerts = alerts
         self.logger = logger
@@ -1937,6 +2375,9 @@ class Reporter:
         self.health_text = health_text
         self.names = names or {}
         self.statsdb = statsdb
+        # The resolver exposes the accountability model, audit log and
+        # search log used for per-person ally reports.
+        self.resolver = resolver
         self.enabled = bool(self.cfg.get("enabled", False))
         self.state_file = self.cfg.get("state_file", "logs/report_state.json")
         self._stop = threading.Event()
@@ -1980,6 +2421,65 @@ class Reporter:
             body += "\n\n" + self.health_text()
         return body, len(alerts)
 
+    def accountability_reports(self, period_start: datetime.datetime,
+                               period_end: datetime.datetime) -> List[Dict]:
+        """Build one accountability report per person for their allies.
+
+        Returns a list of {person, recipients, subject, body} dicts so the
+        same code can send them or preview them via the API.
+        """
+        out: List[Dict] = []
+        res = self.resolver
+        if not res or not res.accountability.enabled:
+            return out
+        all_alerts = res.alerts.read_since(period_start)
+        all_audit = res.audit.read_since(period_start)
+        for person in res.accountability.people:
+            devices = set(person.devices)
+            p_alerts = [a for a in all_alerts if a.get("client") in devices]
+            p_audit = [e for e in all_audit if e.get("client") in devices]
+            p_search = res.search_log.read_since(period_start,
+                                                 list(devices))
+            streak = res.accountability._clean_streak_days(p_alerts)
+            hourly = (res.statsdb.hourly_pattern(
+                list(devices), period_start.date(), period_end.date()
+                + datetime.timedelta(days=1)) if res.statsdb else None)
+            dark = self._dark_devices(person)
+            body = build_accountability_report(
+                person, p_alerts, p_search, p_audit, period_start,
+                period_end, streak, hourly, dark,
+                blocklist_lookup=res.blocklists.blocked_category)
+            recipients = list(person.allies)
+            if person.self_report and devices:
+                pass  # self-report goes to allies list only unless configured
+            flagged = sum(1 for a in p_alerts
+                          if a.get("reason") in ("adult_domain", "bypass_attempt"))
+            subject = (f"Accountability report for {person.name}: "
+                       f"{flagged} flagged" if flagged
+                       else f"Accountability report for {person.name}: all clear")
+            out.append({"person": person.name, "recipients": recipients,
+                        "subject": subject, "body": body})
+        return out
+
+    def _dark_devices(self, person) -> List[str]:
+        """Devices that haven't been seen within the dark-device window."""
+        res = self.resolver
+        if not res or not res.statsdb:
+            return []
+        threshold = datetime.date.today() - datetime.timedelta(
+            days=max(1, int(res.accountability.dark_after_hours / 24)))
+        dark = []
+        last = res.statsdb.last_seen(person.devices)
+        for device, day in last.items():
+            if day is None:
+                continue  # never seen at all — likely just not configured yet
+            try:
+                if datetime.date.fromisoformat(day) < threshold:
+                    dark.append(res.client_label(device))
+            except ValueError:
+                continue
+        return dark
+
     def send_report(self, force: bool = False) -> bool:
         """Build and send the report now.  Returns True when sent."""
         now = datetime.datetime.now(datetime.timezone.utc)
@@ -1991,6 +2491,14 @@ class Reporter:
                    if alert_count else "FaithFilter weekly report: no alerts")
         if not self.notifier.send(subject, body):
             return False
+        # Per-person accountability reports to each person's allies.
+        last = self._last_sent() or (now - datetime.timedelta(days=7))
+        for report in self.accountability_reports(last, now):
+            if report["recipients"]:
+                self.notifier.send(report["subject"], report["body"],
+                                   recipients=report["recipients"])
+                self.logger.info("Accountability report sent for %s to %s",
+                                 report["person"], report["recipients"])
         self._mark_sent(now)
         self.logger.info("Weekly report sent (%d alerts)", alert_count)
         return True
@@ -2341,6 +2849,12 @@ DASHBOARD_HTML = """<!DOCTYPE html><html><head><meta charset="utf-8">
 <button>Watch</button></form><ul id="keywords"></ul></section>
 <section><h2>Unblock requests</h2><table id="unblock"><tbody></tbody></table>
 </section>
+<section style="grid-column:1/-1"><h2>Accountability</h2>
+<div id="people"></div>
+<h2 style="margin-top:.8rem">Search terms (last 7 days)</h2>
+<table id="searches"><tbody></tbody></table>
+<h2 style="margin-top:.8rem">Filter change / tamper log</h2>
+<table id="audit"><tbody></tbody></table></section>
 <section style="grid-column:1/-1"><h2>Recent alerts</h2>
 <table id="alerts"><tbody></tbody></table></section>
 <section style="grid-column:1/-1"><h2>Recent queries</h2>
@@ -2446,6 +2960,26 @@ async function refresh(){
    '<td><button onclick="addUnblock(\\''+encodeURIComponent(r.domain)+
    '\\')">Allow</button></td></tr>').join('')||
    '<tr><td>No requests</td></tr>';
+  const ppl=await (await fetch('/api/people')).json();
+  $('people').innerHTML=ppl.map(p=>
+   '<div class="stat" style="display:inline-block;margin:.2rem">'+
+   '<b>'+esc(p.streak_days)+'d</b>'+esc(p.name)+' clean streak<br>'+
+   '<span style="font-size:.7rem;color:#64748b">'+
+   esc((p.devices||[]).join(', '))+' &rarr; '+
+   esc((p.allies||[]).join(', '))+'</span></div>').join('')||
+   '<span style="color:#64748b">No people configured. Add an '+
+   '<b>accountability</b> section in config.yaml.</span>';
+  const se=await (await fetch('/api/searches?days=7')).json();
+  $('searches').tBodies[0].innerHTML=se.slice(-30).reverse().map(s=>
+   '<tr><td>'+esc(s.time.slice(0,16))+'</td><td>'+esc(nm(s.client))+
+   '</td><td>'+esc(s.engine||s.kind)+'</td><td'+(s.flagged?
+   ' class="blocked"':'')+'>'+esc(s.query||s.url)+(s.flagged?' (!)':'')+
+   '</td></tr>').join('')||'<tr><td>No search data (needs the extension)</td></tr>';
+  const au=await (await fetch('/api/audit?days=30')).json();
+  $('audit').tBodies[0].innerHTML=au.slice(-20).reverse().map(e=>
+   '<tr><td>'+esc(e.time.slice(0,16))+'</td><td>'+esc(e.event)+
+   '</td><td>'+esc(e.detail)+'</td></tr>').join('')||
+   '<tr><td>No filter changes recorded</td></tr>';
  }catch(e){msg('Refresh failed');}
 }
 async function addUnblock(domain){
@@ -2513,7 +3047,12 @@ def create_api_server(resolver: FaithFilterResolver, reporter: Reporter,
         ("faithfilter:" + admin_password).encode()).digest()
     doh_enabled = bool(api_cfg.get("doh", True))
 
-    OPEN_PATHS = {"/login", "/dns-query", "/favicon.ico"}
+    # The extension endpoint authenticates with its own shared key, so it
+    # is exempt from the dashboard session/API-key check.
+    OPEN_PATHS = {"/login", "/dns-query", "/favicon.ico",
+                  "/api/extension/events"}
+    extension_cfg = config.get("extension", {})
+    extension_key = extension_cfg.get("key")
 
     @app.before_request
     def check_auth():
@@ -2569,6 +3108,78 @@ def create_api_server(resolver: FaithFilterResolver, reporter: Reporter,
             # dnslib's pack() returns a bytearray; WSGI requires bytes.
             return Response(bytes(reply.pack()),
                             content_type="application/dns-message")
+
+    @app.route("/api/extension/events", methods=["POST"])
+    def extension_events():
+        """Receive search terms / visited URLs from the browser extension.
+
+        Authenticated with the extension key; the reporting device is
+        identified by its source IP so it lines up with DNS activity.
+        """
+        if not extension_cfg.get("enabled", False):
+            return jsonify({"error": "extension reporting disabled"}), 403
+        if extension_key and request.headers.get("X-Extension-Key") != extension_key:
+            return jsonify({"error": "invalid extension key"}), 401
+        data = request.get_json(silent=True) or {}
+        events = data.get("events") or []
+        client = request.remote_addr or "unknown"
+        stored = 0
+        for ev in events[:200]:
+            kind = "search" if ev.get("query") else "visit"
+            entry = resolver.search_log.add(
+                client, kind, str(ev.get("engine", ""))[:40],
+                str(ev.get("query", "")), str(ev.get("url", "")))
+            stored += 1
+            # A flagged search from a monitored person alerts their allies.
+            if entry["flagged"]:
+                person = resolver.accountability.person_for(client)
+                if person and person.allies:
+                    resolver.notifier.send_throttled(
+                        f"ally-search:{person.name}", 3600,
+                        f"Accountability alert for {person.name}: flagged search",
+                        f"{person.name} searched for something flagged:\n\n"
+                        f"  [{entry['engine']}] {entry['query']}\n",
+                        recipients=person.allies)
+        return jsonify({"stored": stored})
+
+    @app.route("/api/people")
+    def people():
+        rows = []
+        for person in resolver.accountability.people:
+            rows.append({"name": person.name, "devices": person.devices,
+                         "allies": person.allies,
+                         "streak_days": resolver.accountability._clean_streak_days(
+                             resolver.alerts.read_since(
+                                 datetime.datetime.now(datetime.timezone.utc)
+                                 - datetime.timedelta(days=400)))})
+        return jsonify(rows)
+
+    @app.route("/api/audit")
+    def audit_route():
+        days = float(request.args.get("days", 30))
+        since = (datetime.datetime.now(datetime.timezone.utc)
+                 - datetime.timedelta(days=days))
+        return jsonify(resolver.audit.read_since(since))
+
+    @app.route("/api/searches")
+    def searches_route():
+        days = float(request.args.get("days", 7))
+        since = (datetime.datetime.now(datetime.timezone.utc)
+                 - datetime.timedelta(days=days))
+        return jsonify(resolver.search_log.read_since(since))
+
+    @app.route("/api/accountability/preview")
+    def accountability_preview():
+        now = datetime.datetime.now(datetime.timezone.utc)
+        since = now - datetime.timedelta(days=7)
+        reports = reporter.accountability_reports(since, now)
+        if not reports:
+            return ("Accountability is disabled or no people are configured.\n"
+                    "See the 'accountability' section in config.yaml.", 200,
+                    {"Content-Type": "text/plain; charset=utf-8"})
+        text = "\n\n" + ("=" * 70 + "\n\n").join(
+            r["body"] for r in reports)
+        return text, 200, {"Content-Type": "text/plain; charset=utf-8"}
 
     @app.route("/api/status")
     def status():
@@ -2640,11 +3251,20 @@ def create_api_server(resolver: FaithFilterResolver, reporter: Reporter,
         if not client or mode not in Overrides.MODES:
             return jsonify({"error": "client and mode "
                             f"({'/'.join(Overrides.MODES)}) required"}), 400
-        return jsonify(resolver.overrides.set(client, mode, minutes))
+        result = resolver.overrides.set(client, mode, minutes)
+        # Tamper-evidence: weakening filtering is recorded for the ally report.
+        resolver.audit.add(
+            f"override_{mode}",
+            f"{resolver.client_label(client)} set to {mode} for {minutes:g} min",
+            client=client, actor="dashboard")
+        return jsonify(result)
 
     @app.route("/api/override/<client>", methods=["DELETE"])
     def override_cancel(client):
         if resolver.overrides.cancel(client):
+            resolver.audit.add("override_cancel",
+                               f"{resolver.client_label(client)} override "
+                               "cancelled", client=client, actor="dashboard")
             return jsonify({"cancelled": client})
         return jsonify({"error": "no override for that client"}), 404
 
@@ -2728,6 +3348,8 @@ def create_api_server(resolver: FaithFilterResolver, reporter: Reporter,
         if not domain:
             return jsonify({"error": "domain is required"}), 400
         resolver.blocklists.add_whitelist(domain)
+        resolver.audit.add("whitelist_add", f"{domain} was allow-listed",
+                           actor="dashboard")
         return jsonify({"added": domain})
 
     @app.route("/api/whitelist/<domain>", methods=["DELETE"])
@@ -2812,6 +3434,9 @@ def resolve_config_paths(config: Dict, base: str) -> None:
     fix(monitoring, "alert_log_file")
     fix(config.setdefault("email", {}), "state_file")
     fix(config.setdefault("logs", {}), "query_log_file")
+    acct = config.setdefault("accountability", {})
+    fix(acct, "audit_log_file")
+    fix(acct, "search_log_file")
 
 
 DATA_FILE_HEADERS = {
@@ -3022,13 +3647,17 @@ def main() -> None:
     reporter = Reporter(
         config, resolver.alerts, logger, resolver.notifier,
         health_text=lambda: build_health_text(resolver, updates),
-        names=resolver.client_names, statsdb=resolver.statsdb)
+        names=resolver.client_names, statsdb=resolver.statsdb,
+        resolver=resolver)
 
     if args.send_report:
         ok = reporter.send_report(force=True)
         raise SystemExit(0 if ok else 1)
 
     servers = start_dns_server(resolver, config)
+    if resolver.accountability.enabled:
+        resolver.audit.add("service_start",
+                           f"FaithFilter {__version__} started")
     logger.info("FaithFilter DNS server listening on %s:%s",
                 config.get("dns", {}).get("listen_ip", "0.0.0.0"),
                 config.get("dns", {}).get("listen_port", 53))

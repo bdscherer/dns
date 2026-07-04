@@ -185,6 +185,36 @@ monitoring:
   alert_retention_days: 90
 
 # -----------------------------------------------------------------------------
+# Accountability: per-person reports to their accountability partners
+# -----------------------------------------------------------------------------
+accountability:
+  # When enabled, each person's web activity is summarised and e-mailed to
+  # their chosen partners (allies), who also get instant alerts and tamper
+  # notices. This is the "accountability" model (à la Covenant Eyes) done at
+  # the network layer, with no device slowdown.
+  enabled: false
+  people: []
+  #  - name: "Sam"
+  #    devices: ["192.168.1.30", "192.168.1.31"]   # give them DHCP reservations
+  #    allies: ["mentor@example.com", "spouse@example.com"]
+  #    self_report: false        # also send Sam their own copy
+
+  # A device silent for this many hours is flagged as possibly bypassing the
+  # filter (or simply off) in the report.
+  dark_device_hours: 48
+  audit_log_file: "logs/audit.jsonl"       # filter-change / tamper history
+  search_log_file: "logs/searches.jsonl"   # search terms from the extension
+
+# -----------------------------------------------------------------------------
+# Browser extension (optional): search terms & visited sites DNS can't see
+# -----------------------------------------------------------------------------
+extension:
+  # Install the extension in ./extension and point it at this server. It adds
+  # search-term visibility with no device slowdown (no VPN, no screenshots).
+  enabled: false
+  key: ""            # shared secret the extension must send; pick a long one
+
+# -----------------------------------------------------------------------------
 # Safe search / restricted mode enforcement
 # -----------------------------------------------------------------------------
 safe_search:

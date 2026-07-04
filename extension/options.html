@@ -1,0 +1,49 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>FaithFilter Accountability</title>
+  <style>
+    body { font-family: system-ui, sans-serif; width: 320px; padding: 14px;
+           color: #111; }
+    h1 { font-size: 1.05rem; margin: 0 0 .3rem; }
+    p.sub { color: #555; font-size: .8rem; margin: 0 0 .8rem; }
+    label { display: block; font-size: .8rem; margin: .5rem 0 .15rem;
+            font-weight: 600; }
+    input[type=text], input[type=password] { width: 100%; box-sizing: border-box;
+            padding: .4rem; border: 1px solid #ccc; border-radius: 6px; }
+    .row { display: flex; align-items: center; gap: .4rem; margin-top: .6rem; }
+    button { margin-top: .8rem; padding: .45rem .9rem; border: 0;
+             border-radius: 6px; background: #2563eb; color: #fff;
+             cursor: pointer; font-size: .9rem; }
+    #status { margin-top: .6rem; font-size: .8rem; min-height: 1rem; }
+    .ok { color: #059669; } .err { color: #b91c1c; }
+    .note { font-size: .72rem; color: #666; margin-top: .8rem; }
+  </style>
+</head>
+<body>
+  <h1>FaithFilter Accountability</h1>
+  <p class="sub">Sends search terms &amp; visited sites to your FaithFilter
+     server. No page content is captured.</p>
+
+  <label for="serverUrl">Server URL</label>
+  <input type="text" id="serverUrl" placeholder="http://192.168.1.53:5000">
+
+  <label for="extensionKey">Extension key</label>
+  <input type="password" id="extensionKey" placeholder="from config.yaml">
+
+  <div class="row">
+    <input type="checkbox" id="enabled" checked>
+    <label for="enabled" style="margin:0;font-weight:400">Reporting enabled</label>
+  </div>
+
+  <button id="save">Save</button>
+  <button id="test" style="background:#64748b">Test connection</button>
+  <div id="status"></div>
+
+  <p class="note">Tip: for accountability that can't simply be switched off,
+     install this on a managed browser profile the user can't remove.</p>
+
+  <script src="options.js"></script>
+</body>
+</html>

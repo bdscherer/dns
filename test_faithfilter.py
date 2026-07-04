@@ -22,11 +22,12 @@ from dnslib.server import BaseResolver, DNSLogger, DNSServer
 
 import faithfilter
 from faithfilter import (
-    DEFAULT_CONFIG, AlertLog, BlocklistManager, ClientPolicies, DNSCache,
-    FaithFilterResolver, KeywordMonitor, Notifier, Overrides, Reporter,
-    StatsDB, UpdateChecker, apply_backup_zip, build_report,
-    create_api_server, deep_merge, parse_domain_lines, purge_old_data,
-    rotate_if_needed,
+    DEFAULT_CONFIG, Accountability, AlertLog, AuditLog, BlocklistManager,
+    ClientPolicies, DNSCache, FaithFilterResolver, KeywordMonitor, Notifier,
+    Overrides, Person, Reporter, SearchLog, StatsDB, UpdateChecker,
+    apply_backup_zip, build_accountability_report, build_report,
+    classify_domain, create_api_server, deep_merge, parse_domain_lines,
+    purge_old_data, rotate_if_needed,
 )
 
 UPSTREAM_PORT = 15353
@@ -267,7 +268,7 @@ class UnitTests(unittest.TestCase):
         sent = []
 
         class Recording(Notifier):
-            def send(self, subject, body):
+            def send(self, subject, body, recipients=None):
                 sent.append(subject)
                 return True
 
@@ -417,6 +418,102 @@ class FeatureTests(unittest.TestCase):
         self.assertIn("Emma's iPad (192.168.1.20)", text)
 
 
+class AccountabilityTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp)
+
+    def path(self, name):
+        return os.path.join(self.tmp, name)
+
+    def test_classify_domain(self):
+        self.assertEqual(classify_domain("free-porn.example"), "adult")
+        self.assertEqual(classify_domain("bigcasino.example"), "gambling")
+        self.assertEqual(classify_domain("tinder.com"), "dating")
+        self.assertEqual(classify_domain("facebook.com"), "social")
+        self.assertEqual(classify_domain("example.com"), "other")
+        # blocklist category wins for adult / bypass
+        self.assertEqual(classify_domain("weird.example", "adult"), "adult")
+        self.assertEqual(classify_domain("vpn.example", "bypass"), "bypass")
+
+    def test_person_and_group_lookup(self):
+        acct = Accountability({"accountability": {"enabled": True, "people": [
+            {"name": "Sam", "devices": ["10.0.0.5"], "allies": ["a@x.com"]},
+        ]}}, LOGGER)
+        self.assertTrue(acct.enabled)
+        self.assertEqual(acct.person_for("10.0.0.5").name, "Sam")
+        self.assertIsNone(acct.person_for("10.0.0.9"))
+
+    def test_clean_streak(self):
+        now = datetime.datetime.now(datetime.timezone.utc)
+        # A bad alert today ends the streak at 0.
+        alerts_today = [{"time": now.isoformat(), "reason": "adult_domain"}]
+        self.assertEqual(Accountability._clean_streak_days(alerts_today), 0)
+        # A bad alert only long ago leaves a positive streak.
+        old = (now - datetime.timedelta(days=10)).isoformat()
+        self.assertGreater(
+            Accountability._clean_streak_days(
+                [{"time": old, "reason": "bypass_attempt"}]), 5)
+        # No bad alerts caps at 365.
+        self.assertEqual(Accountability._clean_streak_days([]), 365)
+
+    def test_audit_log_round_trip(self):
+        audit = AuditLog(self.path("audit.jsonl"), LOGGER)
+        audit.add("override_pause", "Sam paused 60 min", client="10.0.0.5")
+        since = (datetime.datetime.now(datetime.timezone.utc)
+                 - datetime.timedelta(minutes=1))
+        events = audit.read_since(since)
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["event"], "override_pause")
+
+    def test_search_log_flags_keywords(self):
+        log = SearchLog(self.path("s.jsonl"), LOGGER, keywords=["porn"])
+        clean = log.add("10.0.0.5", "search", "google", "python tutorial")
+        flagged = log.add("10.0.0.5", "search", "google", "free PORN videos")
+        self.assertFalse(clean["flagged"])
+        self.assertTrue(flagged["flagged"])
+        since = (datetime.datetime.now(datetime.timezone.utc)
+                 - datetime.timedelta(minutes=1))
+        self.assertEqual(len(log.read_since(since, ["10.0.0.5"])), 2)
+        self.assertEqual(len(log.read_since(since, ["10.0.0.9"])), 0)
+
+    def test_statsdb_hourly_and_last_seen(self):
+        db = StatsDB(self.path("stats.db"), LOGGER, flush_interval=0)
+        db.record("10.0.0.5", "allowed")
+        db.record("10.0.0.5", "blocked:adult")
+        today = datetime.date.today()
+        pattern = db.hourly_pattern(["10.0.0.5"], today,
+                                    today + datetime.timedelta(days=1))
+        self.assertEqual(len(pattern), 24)
+        self.assertEqual(sum(pattern), 2)
+        seen = db.last_seen(["10.0.0.5", "10.0.0.6"])
+        self.assertEqual(seen["10.0.0.5"], today.isoformat())
+        self.assertIsNone(seen["10.0.0.6"])
+        db.stop()
+
+    def test_build_accountability_report_contents(self):
+        person = Person({"name": "Sam", "devices": ["10.0.0.5"],
+                         "allies": ["ally@x.com"]})
+        now = datetime.datetime.now(datetime.timezone.utc)
+        alerts = [{"time": now.isoformat(), "client": "10.0.0.5",
+                   "domain": "bad-porn.example", "reason": "adult_domain",
+                   "detail": "adult"}]
+        searches = [{"time": now.isoformat(), "client": "10.0.0.5",
+                     "engine": "google", "query": "bad stuff", "flagged": True}]
+        audit = [{"time": now.isoformat(), "event": "override_pause",
+                  "detail": "paused 60m", "client": "10.0.0.5"}]
+        text = build_accountability_report(
+            person, alerts, searches, audit, now - datetime.timedelta(days=7),
+            now, streak_days=0, hourly=[0] * 24, dark_devices=[])
+        self.assertIn("accountability report for Sam", text)
+        self.assertIn("NEEDS A CONVERSATION", text)
+        self.assertIn("bad-porn.example", text)
+        self.assertIn("bad stuff", text)
+        self.assertIn("override_pause", text)
+
+
 class EndToEndTests(unittest.TestCase):
     """Full resolver behind a UDP socket, forwarding to a fake upstream."""
 
@@ -463,6 +560,10 @@ class EndToEndTests(unittest.TestCase):
                     {"name": "bypass", "category": "bypass", "file": path("bypass.txt")},
                 ],
             },
+            "clients": {"overrides_file": path("overrides.json")},
+            "accountability": {"audit_log_file": path("audit.jsonl"),
+                               "search_log_file": path("searches.jsonl")},
+            "stats": {"db_file": path("stats.db")},
             "_config_path": path("config.yaml"),
             "http_api": {"password": "test-password",
                          "password_file": path("admin_password.txt")},
@@ -649,13 +750,22 @@ class ApiTests(unittest.TestCase):
                          "whitelist": path("whitelist.txt"),
                          "cache_dir": path("cache"), "sources": []},
             "monitoring": {"alert_log_file": path("alerts.jsonl")},
+            "clients": {"overrides_file": path("overrides.json")},
+            "accountability": {"enabled": True, "people": [
+                {"name": "Sam", "devices": ["127.0.0.1"],
+                 "allies": ["ally@example.com"]}],
+                "audit_log_file": path("audit.jsonl"),
+                "search_log_file": path("searches.jsonl")},
+            "extension": {"enabled": True, "key": "ext-key"},
+            "stats": {"db_file": path("stats.db")},
             "logs": {"query_log_file": None},
             "_config_path": path("config.yaml"),
             "http_api": {"password": "test-password",
                          "password_file": path("admin_password.txt")},
         }
         resolver = FaithFilterResolver(cls.config, LOGGER)
-        reporter = Reporter(cls.config, resolver.alerts, LOGGER)
+        reporter = Reporter(cls.config, resolver.alerts, LOGGER,
+                            resolver=resolver, statsdb=resolver.statsdb)
         cls.app = create_api_server(resolver, reporter, cls.config,
                                     None, LOGGER)
 
@@ -727,6 +837,38 @@ class ApiTests(unittest.TestCase):
         self.login()
         status = self.client.get("/api/status").get_json()
         self.assertEqual(status["version"], faithfilter.__version__)
+
+    def test_extension_endpoint_stores_and_authenticates(self):
+        # No dashboard login needed; uses the extension key instead.
+        good = self.client.post(
+            "/api/extension/events",
+            headers={"X-Extension-Key": "ext-key"},
+            json={"events": [{"engine": "google", "query": "hello world"}]})
+        self.assertEqual(good.status_code, 200)
+        self.assertEqual(good.get_json()["stored"], 1)
+        bad = self.client.post("/api/extension/events",
+                               headers={"X-Extension-Key": "wrong"},
+                               json={"events": []})
+        self.assertEqual(bad.status_code, 401)
+
+    def test_people_and_accountability_preview(self):
+        self.login()
+        people = self.client.get("/api/people").get_json()
+        self.assertTrue(any(p["name"] == "Sam" for p in people))
+        preview = self.client.get("/api/accountability/preview")
+        self.assertEqual(preview.status_code, 200)
+        self.assertIn(b"Sam", preview.data)
+
+    def test_audit_recorded_on_override(self):
+        self.login()
+        self.client.post("/api/override", json={
+            "client": "127.0.0.1", "mode": "pause", "minutes": 5})
+        try:
+            audit = self.client.get("/api/audit").get_json()
+            self.assertTrue(any(e["event"] == "override_pause" for e in audit))
+        finally:
+            # Don't leak the override into other tests' shared resolver.
+            self.client.delete("/api/override/127.0.0.1")
 
 
 if __name__ == "__main__":

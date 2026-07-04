@@ -1,0 +1,16 @@
+{
+  "manifest_version": 3,
+  "name": "FaithFilter Accountability",
+  "version": "1.0.0",
+  "description": "Reports search terms and visited sites to your FaithFilter server so an accountability partner has the full picture. No page content is captured.",
+  "permissions": ["webNavigation", "storage", "alarms"],
+  "host_permissions": ["<all_urls>"],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "options_page": "options.html",
+  "action": {
+    "default_title": "FaithFilter Accountability",
+    "default_popup": "options.html"
+  }
+}

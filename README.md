@@ -66,6 +66,12 @@ their DNS server and it will:
 - **Secondary-server sync** — run a second FaithFilter (e.g. a Raspberry
   Pi) as DNS 2; follower mode pulls the primary's lists automatically so
   both enforce the same rules.
+- **Accountability partners** — assign each person their devices and one or
+  more *allies*; each ally gets that person's weekly report (category
+  breakdown, time-of-day pattern, clean streak, evasion attempts, search
+  terms, tamper log) plus instant alerts — network-layer accountability
+  with no device slowdown. An optional browser extension adds search-term
+  visibility.
 
 ## Files
 
@@ -317,6 +323,11 @@ The JSON API requires either a logged-in session or an `X-API-Key` header
 | `/api/overrides` | GET | Active pause/unfiltered overrides. |
 | `/api/override` | POST | `{"client": ip, "mode": "pause"\|"unfiltered", "minutes": N}`. |
 | `/api/override/<client>` | DELETE | Cancel a device's override ("resume"). |
+| `/api/people` | GET | Accountability people with clean-streak days. |
+| `/api/audit?days=N` | GET | Filter-change / tamper log. |
+| `/api/searches?days=N` | GET | Search terms & visits from the extension. |
+| `/api/accountability/preview` | GET | Plain-text preview of the ally reports. |
+| `/api/extension/events` | POST | Extension reporting endpoint (extension-key auth). |
 | `/dns-query` | GET/POST | DNS-over-HTTPS (RFC 8484); no auth required. |
 
 ## How a query is handled
@@ -461,6 +472,59 @@ primary automatically.
    Devices will use the Pi automatically whenever the primary is down —
    and it enforces the same rules, so an outage never becomes an
    unfiltered window.
+
+## Accountability (rivaling Covenant Eyes, without the slowdown)
+
+On-device accountability tools tunnel all traffic through a VPN and take
+screenshots analysed on the device — that's what drains battery and adds
+lag. FaithFilter does the work at the network layer, so devices do nothing
+extra (and browsing is actually faster thanks to the DNS cache). The honest
+trade-off: it sees *where* devices go and *what they search*, not the pixels
+on the screen — roughly 90% of the accountability signal at 0% of the
+performance cost.
+
+Assign people, devices and allies:
+
+```yaml
+accountability:
+  enabled: true
+  people:
+    - name: "Sam"
+      devices: ["192.168.1.30", "192.168.1.31"]
+      allies: ["mentor@example.com", "spouse@example.com"]
+```
+
+Each ally then receives Sam's report directly, with:
+
+- **Category breakdown** (adult, gambling, dating, social, streaming, …)
+- **Time-of-day pattern** (late-night activity is itself a signal)
+- **Clean streak** — consecutive days with no flagged activity
+- **Evasion attempts** — VPN/proxy/DoH requests, and **dark-device**
+  detection when a device stops appearing (bypassing or switched off)
+- **Tamper log** — every pause, unfiltered-time grant and whitelist change
+- **Search terms** — when the optional browser extension is installed
+
+Allies also get **instant e-mail alerts** (throttled) the moment a device
+hits adult content or a bypass service. Preview everything at
+`GET /api/accountability/preview`.
+
+### Search-term visibility: the browser extension
+
+DNS can't see search terms or in-page activity. The optional extension in
+[`extension/`](extension/) closes most of that gap **without any device
+slowdown** — no VPN, no screenshots, no on-device analysis; it just reads
+the destination hostname and the search query from the URL and batches them
+to the server once a minute. Enable it server-side:
+
+```yaml
+extension:
+  enabled: true
+  key: "pick-a-long-random-string"
+```
+
+then load `extension/` as an unpacked extension and point it at your server
+(see [`extension/README.md`](extension/README.md)). For accountability that
+can't simply be switched off, install it on a managed browser profile.
 
 ## Installing as a service in one command
 
