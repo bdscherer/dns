@@ -1,0 +1,79 @@
+name: Test and build executables
+
+on:
+  push:
+    branches: ["main", "claude/local-dns-blocker-rhlwpl"]
+    tags: ["v*"]
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -r requirements.txt
+      - run: python test_faithfilter.py
+
+  build:
+    needs: test
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            artifact: faithfilter-windows-x64
+            binary: faithfilter.exe
+          - os: ubuntu-latest
+            artifact: faithfilter-linux-x64
+            binary: faithfilter
+          # 64-bit ARM Linux build (Raspberry Pi 3/4/5 with a 64-bit OS).
+          # These runners are free for public repositories only; remove this
+          # entry if the repo is private and the job fails to start.
+          - os: ubuntu-24.04-arm
+            artifact: faithfilter-linux-arm64
+            binary: faithfilter
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -r requirements.txt pyinstaller
+      - name: Build standalone executable
+        run: pyinstaller --onefile --name faithfilter faithfilter.py
+      - name: Assemble distribution folder
+        shell: bash
+        run: |
+          mkdir -p pkg
+          cp "dist/${{ matrix.binary }}" pkg/
+          cp README.md pkg/
+          # Nothing else is needed: all configuration is built into the
+          # executable, which creates its data files on first run.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: pkg/
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: Zip each platform build
+        run: |
+          cd artifacts
+          for dir in */; do
+            name="${dir%/}"
+            (cd "$name" && zip -r "../${name}.zip" .)
+          done
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/*.zip

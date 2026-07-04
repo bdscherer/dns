@@ -1,59 +1,302 @@
+# =============================================================================
+# FaithFilter configuration
+# =============================================================================
+
 dns:
-  # IP address and port for the DNS service to listen on. "0.0.0.0" will listen
-  # on all network interfaces. Port 53 is the default DNS port and requires
-  # super‑user privileges. You can change it for testing or run the service
-  # with sudo for privileged ports.
+  # IP address and port for the DNS service. "0.0.0.0" listens on all
+  # interfaces. Port 53 requires root privileges.
   listen_ip: "0.0.0.0"
   listen_port: 53
 
-  # Upstream DNS servers used for forwarding queries that are not filtered.
-  # You can specify multiple entries for redundancy. These servers are only
-  # consulted when the domain is not on the blocklist or subject to a forced
-  # rewrite (SafeSearch/YouTube mode).
-  upstream_dns:
-    - "1.1.1.1"   # Cloudflare DNS (Anycast)
-    - "8.8.8.8"   # Google Public DNS (Anycast)
+  # Also answer DNS over TCP (recommended; some clients require it).
+  listen_tcp: true
 
-  # Timeout in seconds when forwarding DNS queries to upstream servers.
+  # Upstream DNS servers for queries that pass all filters. "host" or
+  # "host:port" entries are accepted; the first server to answer wins.
+  upstream_dns:
+    - "1.1.1.1"   # Cloudflare
+    - "8.8.8.8"   # Google
+
+  # Timeout in seconds when forwarding to an upstream server.
   forward_timeout: 5
 
-  # Enable or disable Google SafeSearch enforcement. When true, queries to
-  # google.com and related domains will return the SafeSearch VIP address.
-  safe_search: true
+  # How blocked domains are answered:
+  #   "nxdomain" - respond that the domain does not exist (default)
+  #   "zero_ip"  - respond with 0.0.0.0 / :: (some apps behave better)
+  # (When block_page.enabled is true, A queries answer with this server's
+  # address instead so browsers land on the explanation page.)
+  block_response: "nxdomain"
 
-  # Configure YouTube restriction mode. Accepted values:
-  #   "off"      – Do not rewrite YouTube domains.
-  #   "moderate" – Map YouTube domains to the moderate restricted IP (216.239.38.119).
-  #   "strict"  – Map YouTube domains to the strict restricted IP (216.239.38.120).
-  youtube_mode: "strict"
+  # Block domains whose CNAME chain leads to a blocked domain (ad networks
+  # hide trackers behind innocent-looking first-party subdomains).
+  block_cname_cloaking: true
+
+  # Cache upstream answers for their TTL; serve_stale keeps the network
+  # working from cache when every upstream is unreachable.
+  cache:
+    enabled: true
+    max_entries: 20000
+    serve_stale: true
+
+# -----------------------------------------------------------------------------
+# Blocking: your own sites + subscribed blocklist sources
+# -----------------------------------------------------------------------------
+blocking:
+  # Your personal list of individual sites to block (one domain per line,
+  # subdomains are blocked automatically). Manage it by editing the file or
+  # through the HTTP API.
+  my_blocklist: "blocklist.txt"
+
+  # Domains that must always resolve, overriding every blocklist.
+  whitelist: "whitelist.txt"
+
+  # Blocklist sources: plain-text lists, either local files or online URLs
+  # that the server downloads and refreshes automatically. Both plain
+  # domain lists and hosts-file format ("0.0.0.0 domain") are understood.
+  #
+  # category controls behaviour:
+  #   adult  - blocked AND recorded in the weekly monitoring report
+  #   ads    - blocked silently (ad/tracker blocking)
+  #   custom - blocked silently
+  sources:
+    - name: "adult-content"
+      category: "adult"
+      url: "https://raw.githubusercontent.com/StevenBlack/hosts/master/alternates/porn-only/hosts"
+      enabled: true
+
+    - name: "ads-and-trackers"
+      category: "ads"
+      url: "https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts"
+      enabled: true
+
+    # DoH resolvers, VPNs and proxies - blocking these stops devices from
+    # tunnelling their DNS around the filter. Hits raise a "bypass_attempt"
+    # alert in the weekly report.
+    - name: "bypass-doh-vpn-proxy"
+      category: "bypass"
+      url: "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/wildcard/doh-vpn-proxy-bypass-onlydomains.txt"
+      enabled: true
+
+    # Additional examples (disabled by default):
+    #- name: "gambling"
+    #  category: "custom"
+    #  url: "https://raw.githubusercontent.com/StevenBlack/hosts/master/alternates/gambling-only/hosts"
+    #  enabled: true
+    #- name: "my-office-list"
+    #  category: "custom"
+    #  file: "/etc/faithfilter/office-blocklist.txt"
+
+  # Answer NXDOMAIN for browser/OS "canary" domains: turns off Firefox's
+  # built-in DNS-over-HTTPS and iCloud Private Relay so devices keep using
+  # this resolver.
+  block_doh_canary: true
+
+  # Re-download online sources every N hours.
+  refresh_hours: 24
+
+  # Where downloaded lists are cached (survives restarts and outages).
+  cache_dir: "lists_cache"
+
+# -----------------------------------------------------------------------------
+# Per-device policies: groups, filtering levels and curfews
+# -----------------------------------------------------------------------------
+clients:
+  # Friendly device names, shown in reports, alerts and the dashboard.
+  names: {}
+  #  "192.168.1.20": "Emma's iPad"
+  #  "192.168.1.21": "Family PC"
+
+  # Temporary pause/unfiltered overrides (dashboard "Pause"/"Allow" buttons)
+  # are persisted here so they survive restarts.
+  overrides_file: "logs/overrides.json"
+
+  # Devices are matched by IP or CIDR range (give them DHCP reservations on
+  # your router first). Clients in no group get full filtering with safe
+  # search and no curfew. Group settings:
+  #   filtering:   "full" (block + report), "monitor_only" (report only),
+  #                or "off" (no filtering at all)
+  #   safe_search: enforce safe search for this group (default true)
+  #   curfew:      windows when ALL internet access is blocked
+  #                (server-local time; windows may cross midnight)
+  groups: []
+  #  - name: "kids"
+  #    members: ["192.168.1.20", "192.168.1.21"]
+  #    filtering: "full"
+  #    safe_search: true
+  #    curfew:
+  #      - days: ["sun", "mon", "tue", "wed", "thu"]
+  #        from: "21:30"
+  #        to: "06:30"
+  #  - name: "parents"
+  #    members: ["192.168.1.10"]
+  #    filtering: "off"
+
+# -----------------------------------------------------------------------------
+# Block page: explain blocks in the browser and collect unblock requests
+# -----------------------------------------------------------------------------
+block_page:
+  # When enabled, blocked A queries answer with this server's IP and a small
+  # web server on `port` shows a "site blocked" page with an unblock-request
+  # form (requests appear on the dashboard and can trigger an e-mail).
+  # Note: HTTPS sites show a certificate warning before the page - that is
+  # inherent to DNS-level blocking.
+  enabled: false
+  port: 80
+  ip: ""                     # auto-detected when empty
+  unblock_requests_file: "logs/unblock_requests.jsonl"
+
+# -----------------------------------------------------------------------------
+# Notifications (uses the same SMTP account as the weekly report)
+# -----------------------------------------------------------------------------
+notifications:
+  instant_alerts: true          # e-mail when a device hits adult/bypass content
+  instant_min_minutes: 60       # at most one instant alert per device per hour
+  notify_on_start: false        # e-mail whenever the service (re)starts
+  refresh_failure_threshold: 3  # warn after N consecutive failed downloads
+
+# -----------------------------------------------------------------------------
+# Monitoring: what triggers an alert in the weekly report
+# -----------------------------------------------------------------------------
+monitoring:
+  # Scan every queried domain for a built-in list of adult keywords, so
+  # adult-adjacent sites are caught even when they are not on a blocklist.
+  adult_keywords_enabled: true
+
+  # Your own keywords - any queried domain containing one of these is
+  # recorded in the weekly report.
+  extra_keywords: []
+  #  - "casino"
+  #  - "bet"
+
+  # Optional file with one keyword per line (managed via the API too).
+  keywords_file: "keywords.txt"
+
+  # Substrings that must NOT count as keyword matches (false positives).
+  # "essex", "sussex", "middlesex" and "sexton" are always excluded.
+  keyword_exceptions: []
+
+  # Block domains that match a keyword (true) or just record them (false).
+  block_keyword_matches: false
+
+  # Where alerts are stored for the weekly report.
+  alert_log_file: "logs/alerts.jsonl"
+
+  # Alerts and unblock requests older than this are deleted daily.
+  alert_retention_days: 90
+
+# -----------------------------------------------------------------------------
+# Safe search / restricted mode enforcement
+# -----------------------------------------------------------------------------
+safe_search:
+  google: true        # forces SafeSearch on google.com and regional domains
+  bing: true          # forces strict.bing.com
+  duckduckgo: true    # forces safe.duckduckgo.com
+  youtube: "strict"   # "off", "moderate" or "strict" restricted mode
+
+  # Enforce restricted mode for any other service that provides a safe DNS
+  # entry point: queries for the listed domains are answered with the
+  # address of "target" (fallback_ip is used if target cannot be resolved).
+  custom_rewrites: []
+  #  - name: "pixabay"
+  #    domains: ["pixabay.com", "www.pixabay.com"]
+  #    target: "safesearch.pixabay.com"
+  #    fallback_ip: "104.18.20.183"
+
+# -----------------------------------------------------------------------------
+# Weekly e-mail report
+# -----------------------------------------------------------------------------
+email:
+  enabled: false            # set true after filling in SMTP details below
+  smtp_host: "smtp.gmail.com"
+  smtp_port: 587
+  use_tls: true             # STARTTLS (typical for port 587)
+  use_ssl: false            # implicit TLS (typical for port 465)
+  username: "you@gmail.com"
+  # Prefer an environment variable for the password (for Gmail create an
+  # "App password"). A literal "password:" key is also accepted.
+  password_env: "FAITHFILTER_SMTP_PASSWORD"
+  from: "FaithFilter <you@gmail.com>"
+  to:
+    - "bdscherer@gmail.com"
+
+  # When to send: every <report_day> at <report_hour>:00.
+  report_day: "sunday"
+  report_hour: 8
+  # "local" (default) uses the server's clock, matching curfews;
+  # "utc" keeps the pre-2.1 behaviour.
+  report_timezone: "local"
+
+  # Send a "no alerts" e-mail on quiet weeks so you know it is working.
+  send_if_empty: true
+
+  # Remembers when the last report went out.
+  state_file: "logs/report_state.json"
+
+# -----------------------------------------------------------------------------
+# Logging and API
+# -----------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# Long-term statistics, update checks, and secondary-server sync
+# -----------------------------------------------------------------------------
+stats:
+  # Per-day, per-device counters (SQLite) powering the dashboard trends
+  # view and the week-over-week lines in the report.
+  enabled: true
+  db_file: "logs/stats.db"
+  retention_days: 365
+
+updates:
+  # Check GitHub daily for a newer tagged release. Shown on the dashboard
+  # and in the weekly report; nothing is ever installed automatically.
+  check: true
+  repo: "bdscherer/dns"
+
+sync:
+  # FOLLOWER MODE for a secondary server (e.g. a Raspberry Pi running as
+  # your router's DNS 2). Pulls blocklist/whitelist/keywords from the
+  # primary's /api/backup on an interval so both servers enforce the same
+  # rules. Set http_api.api_key on the PRIMARY and copy it here.
+  enabled: false
+  primary_url: ""            # e.g. "http://192.168.1.53:5000"
+  api_key: ""
+  interval_minutes: 60
+  include_config: false      # also pull config.yaml (requires restart)
 
 logs:
-  # Path to the file where DNS queries will be appended. The parent directory
-  # should exist and be writable by the service user. This file can be
-  # consumed by the HTTP API for reporting.
   query_log_file: "logs/queries.log"
-
-  # Logging level: DEBUG, INFO, WARNING, ERROR or CRITICAL. INFO is usually
-  # appropriate for production.
   log_level: "INFO"
+  max_log_mb: 20       # rotate query/alert logs beyond this size
+  log_backups: 3       # rotated copies to keep (.1, .2, ...)
+  # Rotated query logs older than this are deleted daily - browsing
+  # history is sensitive, so it is not kept forever.
+  retention_days: 30
 
-blocklist:
-  # Location of the blocklist file. Each line should contain a domain to be
-  # blocked. Subdomains of a listed domain are also blocked. Empty lines and
-  # comments (#) are ignored.
-  file: "blocklist.txt"
-
-whitelist:
-  # Location of the whitelist file. Domains listed here will always be
-  # forwarded even if they appear on the blocklist. This is useful for
-  # overriding false positives. Format is the same as blocklist.txt.
-  file: "whitelist.txt"
-
+# -----------------------------------------------------------------------------
+# Dashboard, API and DNS-over-HTTPS
+# -----------------------------------------------------------------------------
 http_api:
-  # Whether to enable the built‑in HTTP API for management and reporting.
-  # The API provides endpoints for viewing logs, updating blocklists and
-  # whitelists, and checking service status. You can disable this by
-  # setting enable to false if you prefer to manage files manually.
   enable: true
-  host: "0.0.0.0"
+  host: "127.0.0.1"    # use "0.0.0.0" to reach the dashboard from the LAN
   port: 5000
+
+  # Dashboard password. Leave empty to auto-generate one on first run
+  # (stored in admin_password.txt next to the config, shown in the log).
+  password: ""
+
+  # Optional shared secret for scripts ("X-API-Key: <value>" header).
+  api_key: ""
+
+  # Serve DNS-over-HTTPS (RFC 8484) at /dns-query. Browsers and phones
+  # require HTTPS: set cert_file/key_file (e.g. from Let's Encrypt) or put
+  # the endpoint behind a TLS reverse proxy.
+  doh: true
+  cert_file: ""
+  key_file: ""
+
+# DNS-over-TLS listener for Android "Private DNS". Needs a certificate
+# matching the hostname configured on the phones.
+dot:
+  enabled: false
+  port: 853
+  cert_file: ""
+  key_file: ""

@@ -1,17 +1,42 @@
+# Configuration for manual local testing (unprivileged port, no e-mail).
+# Start with:  python3 faithfilter.py --config test_config.yaml
+# Query with:  dig @127.0.0.1 -p 5353 exampleadult1.com
 dns:
   listen_ip: "127.0.0.1"
   listen_port: 5353
+  listen_tcp: true
   upstream_dns:
+    - "1.1.1.1"
     - "8.8.8.8"
   forward_timeout: 5
-  safe_search: true
-  youtube_mode: "strict"
+  block_response: "nxdomain"
+
+blocking:
+  my_blocklist: "blocklist.txt"
+  whitelist: "whitelist.txt"
+  sources: []
+  cache_dir: "lists_cache"
+
+monitoring:
+  adult_keywords_enabled: true
+  extra_keywords: []
+  keywords_file: "keywords.txt"
+  alert_log_file: "logs/alerts.jsonl"
+
+safe_search:
+  google: true
+  bing: true
+  duckduckgo: true
+  youtube: "strict"
+
+email:
+  enabled: false
+
 logs:
-  query_log_file: "faithfilter/test_queries.log"
+  query_log_file: "logs/queries.log"
   log_level: "DEBUG"
-blocklist:
-  file: "faithfilter/blocklist.txt"
-whitelist:
-  file: "faithfilter/whitelist.txt"
+
 http_api:
-  enable: false
+  enable: true
+  host: "127.0.0.1"
+  port: 5001

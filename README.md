@@ -1,188 +1,356 @@
-# FaithFilter αlpha
+# FaithFilter
 
-FaithFilter is a self‑hosted DNS filtering service designed to help parents,
-schools and small organisations block access to adult content at the DNS
-level.  It allows you to maintain your own blocklists and whitelists,
-keeps a log of every DNS query for reporting, and can enforce **Google
-SafeSearch** and **YouTube restricted modes** across your entire network.
+FaithFilter is a self-hosted DNS filtering service for families, schools and
+small organisations. Point your router (or individual devices) at it as
+their DNS server and it will:
 
-This document explains how the system works and provides step‑by‑step
-instructions for deploying the alpha version on a fresh Virtual Machine
-running Ubuntu (or a similar Linux distribution).  FaithFilter has
-minimal dependencies and can be run with Python 3.8+.
+- **Block individual sites you choose** — a simple personal blocklist file,
+  editable by hand or through the HTTP API. Subdomains are blocked
+  automatically.
+- **Subscribe to blocklist sources** — any number of plain-text lists,
+  **local files or online URLs**, in either one-domain-per-line or
+  hosts-file (`0.0.0.0 domain`) format. Online sources are downloaded
+  automatically, cached on disk, and refreshed on a schedule.
+- **Block ads and trackers** — just another blocklist source with the
+  category `ads` (the default config subscribes to the StevenBlack hosts
+  list).
+- **Monitor adult and adult-adjacent activity** — attempts to reach a
+  domain on an `adult`-category list, or any domain containing a built-in
+  adult keyword or **your own keywords**, are recorded as alerts.
+- **E-mail you a weekly report** — a per-device summary of adult-content
+  attempts and keyword hits, sent over SMTP on the day/hour you choose.
+- **Enforce safe/restricted search** — Google SafeSearch (all regional
+  domains), Bing strict mode, DuckDuckGo safe mode, YouTube
+  moderate/strict Restricted Mode, and a generic `custom_rewrites`
+  mechanism for **any other service** that offers a restricted DNS entry
+  point. IPv6 (AAAA) answers for rewritten domains are suppressed so the
+  enforcement cannot be bypassed over IPv6.
+- **Resist bypass attempts** — a built-in blocklist of DNS-over-HTTPS
+  resolvers, VPNs and proxies (hits raise a `bypass_attempt` alert),
+  NXDOMAIN for the Firefox DoH and iCloud Private Relay canary domains,
+  and CNAME-cloaking detection that blocks domains whose CNAME chain leads
+  to a blocked tracker.
+- **Web dashboard** — password-protected (a password is auto-generated on
+  first run): live stats, recent queries and alerts, list and keyword
+  management, unblock requests, backup download, test e-mail. The JSON API
+  behind it requires the same login (or an `X-API-Key`).
+- **Per-device policies** — group devices by IP/CIDR; per group: full
+  filtering, monitor-only, or unfiltered; safe search on/off; and
+  **curfews** that block all internet access during set hours (may cross
+  midnight).
+- **Block page** — optionally answer blocked domains with a friendly
+  "site blocked" page including an unblock-request form (requests show up
+  on the dashboard and can e-mail you).
+- **Instant + failure alerts** — optional immediate e-mail when a device
+  hits adult content or a bypass service (throttled per device), a warning
+  when blocklist downloads keep failing, an optional service-start notice,
+  and a health section in every weekly report.
+- **Fast and outage-proof** — DNS responses are cached for their TTL and
+  served stale if every upstream is down; query and alert logs rotate by
+  size automatically.
+- **DNS-over-HTTPS / DNS-over-TLS service** — an RFC 8484 `/dns-query`
+  endpoint and an optional DoT listener (Android "Private DNS"), so phones
+  can keep using the filter even away from home (requires a certificate).
+- **Device names** — map IPs to friendly names ("Emma's iPad") shown in
+  reports, alerts and the dashboard.
+- **Pause & bonus time** — one-click dashboard buttons to pause a device's
+  internet or grant temporary unfiltered time, with automatic expiry
+  (persisted across restarts).
+- **Privacy-aware retention** — rotated query logs, alerts and unblock
+  requests are auto-deleted after a configurable age; browsing history is
+  not hoarded forever.
+- **Trends** — per-day, per-device statistics (SQLite) with a dashboard
+  trends view and week-over-week comparisons in the report.
+- **Update awareness** — checks GitHub daily for a newer release and says
+  so on the dashboard and in the weekly report (never auto-installs).
+- **Secondary-server sync** — run a second FaithFilter (e.g. a Raspberry
+  Pi) as DNS 2; follower mode pulls the primary's lists automatically so
+  both enforce the same rules.
 
-## Features
-
-- **DNS‑level blocking of explicit domains** – FaithFilter maintains a
-  blocklist of domains that serve pornography or other inappropriate
-  material.  Domains on the list (and their sub‑domains) are returned
-  as *NXDOMAIN* to the client.  The project deliberately keeps this
-  alpha blocklist small by default; you are encouraged to integrate
-  comprehensive community lists.  The unified porn blocklist at
-  <https://github.com/columndeeply/hosts> merges over 12 million
-  domains from various sources and includes redirects to “Safe
-  Browsing” versions of common search engines【733584132698443†L0-L27】.
-
-- **Configurable whitelist** – sometimes legitimate sites are swept up
-  in broad blocklists.  Add domains to the whitelist to ensure they
-  resolve normally.  Whitelist entries override the blocklist.
-
-- **Google SafeSearch enforcement** – Google provides a “SafeSearch
-  Virtual IP (VIP)” service.  If you map `www.google.com` and other
-  country‑specific Google domains to `forcesafesearch.google.com`, all
-  searches will be filtered for explicit results【981322123641601†L65-L160】.
-  The VIP address currently resolves to `216.239.38.120`【981322123641601†L94-L104】.
-  FaithFilter rewrites DNS requests for Google search domains to this
-  VIP when SafeSearch is enabled.
-
-- **YouTube restricted mode** – YouTube provides two levels of
-  filtering: a “moderate” mode and a stricter “restrict” mode.  These
-  are enforced by mapping common YouTube hostnames to Google‑owned
-  IPs: `216.239.38.119` for the *restrict‑moderate* service and
-  `216.239.38.120` for the *restrict* service【15477614038885†L90-L106】.  When
-  YouTube mode is set to `moderate` or `strict` in the configuration,
-  queries for YouTube domains are rewritten to the appropriate IP【15477614038885†L90-L106】.
-
-- **HTTP API for management and reporting** – an optional Flask‑based
-  API provides endpoints for viewing recent queries, inspecting or
-  updating blocklists and whitelists, and reloading lists without
-  restarting the DNS service.
-
-- **Detailed logging** – every DNS query is timestamped and recorded
-  with the client’s IP, the requested domain and the action taken
-  (allowed, blocked, SafeSearch rewrite, YouTube rewrite or
-  whitelisted).  Logs are stored in plain text for easy analysis.
-
-## Directory Structure
+## Files
 
 ```
-faithfilter/
-├─ faithfilter.py        ← main Python program implementing the DNS
-│                           forwarder, filtering logic and optional API
-├─ config.yaml           ← default configuration file (copy and edit)
-├─ blocklist.txt         ← sample blocklist (one domain per line)
-├─ whitelist.txt         ← sample whitelist
-├─ requirements.txt      ← Python dependencies
-└─ README.md             ← this document
+faithfilter.py       ← the whole service (DNS server, filters, e-mail, API)
+config.yaml          ← main configuration (fully commented)
+test_config.yaml     ← config for local testing on port 5353
+blocklist.txt        ← your personal list of blocked sites
+whitelist.txt        ← domains that must always resolve
+keywords.txt         ← your monitored keywords (one per line)
+test_faithfilter.py  ← offline test suite (python3 test_faithfilter.py)
+requirements.txt     ← Python dependencies (dnslib, Flask, PyYAML)
 ```
 
-## Prerequisites
+## Quick start
 
-- A Vultr VM or other Linux machine with root access.  The alpha
-  version has been tested on **Ubuntu 22.04 LTS** but should work on
-  any recent Linux distribution.
-- Python 3.8 or newer.  Install `python3` and `python3‑pip` from your
-  package manager if they are not present.
-- TCP/UDP port 53 open in your server’s firewall.  Vultr’s default
-  firewall usually permits DNS queries on port 53 but double‑check
-  your security group rules.
+```sh
+apt update && apt install -y python3 python3-pip
+pip3 install -r requirements.txt
 
-## Installation Steps
+# Edit config.yaml (see below), then:
+sudo python3 faithfilter.py --config config.yaml
+```
 
-1. **Create a VM on Vultr**.
+## Standalone executable (no Python required)
 
-   - Log in to your Vultr dashboard, click **Deploy New Server** and
-     select a location near your users.  Choose **Ubuntu 22.04 x64** as
-     the operating system and an instance size that meets your needs
-     (even the smallest plan is sufficient for an alpha deployment).
-   - After deployment completes, note the server’s public IP address
-     and set a strong root password or SSH key.
+Every push to `main` builds self-contained executables via GitHub Actions
+(`.github/workflows/build.yml`): `faithfilter.exe` for Windows,
+`faithfilter` for Linux x64 and Linux ARM64 (Raspberry Pi 64-bit OS).
+Download them from the repository's **Actions** tab (workflow artifacts) or,
+for tagged releases (`git tag v1.0 && git push --tags`), from the
+**Releases** page. Each artifact contains the executable plus template
+`config.yaml`, `blocklist.txt`, `whitelist.txt` and `keywords.txt`.
 
-2. **SSH into the server**.
+**The executable is fully self-contained — no configuration files are
+required.** All defaults (adult + ads blocklists, safe search, YouTube
+strict, localhost API) are built in, and on first run it creates its own
+`blocklist.txt`, `whitelist.txt` and `keywords.txt` next to itself:
 
-   ```sh
-   ssh root@your.vultr.ip.address
+```sh
+sudo ./faithfilter                 # Linux
+faithfilter.exe                    # Windows (run as Administrator)
+```
+
+To configure e-mail reports and other personal settings, run the built-in
+wizard once — it asks a few questions and writes a minimal `config.yaml`
+for you:
+
+```sh
+sudo ./faithfilter --setup         # or: faithfilter.exe --setup
+```
+
+If a `config.yaml` exists next to the executable it is merged over the
+built-in defaults, so it only ever needs to contain the settings you
+changed (the repository's `config.yaml` documents every available option).
+Relative paths resolve against the executable's folder, so everything stays
+in the install directory even when launched as a service.
+
+To build one yourself instead (must be built on the OS you target —
+PyInstaller does not cross-compile):
+
+```sh
+pip3 install -r requirements.txt pyinstaller
+pyinstaller --onefile --name faithfilter faithfilter.py
+# result: dist/faithfilter (or dist\faithfilter.exe on Windows)
+```
+
+### Running the EXE on Windows
+
+1. Extract the zip to `C:\FaithFilter` and (optionally) run
+   `faithfilter.exe --setup` in a terminal to configure e-mail reports.
+2. Port 53 must be free: if the **Internet Connection Sharing (ICS)**
+   service is running, stop and disable it (`services.msc`).
+3. Allow DNS through the firewall (admin prompt):
+   ```bat
+   netsh advfirewall firewall add rule name="FaithFilter DNS UDP" dir=in action=allow protocol=UDP localport=53
+   netsh advfirewall firewall add rule name="FaithFilter DNS TCP" dir=in action=allow protocol=TCP localport=53
    ```
+4. Test by double-clicking `faithfilter.exe` (or run it in an
+   Administrator terminal to see the log output).
+5. To run it permanently as a Windows service, use
+   [NSSM](https://nssm.cc/): `nssm install FaithFilter C:\FaithFilter\faithfilter.exe`,
+   then in the NSSM dialog set the startup directory to `C:\FaithFilter`
+   and add `FAITHFILTER_SMTP_PASSWORD=<app password>` under
+   *Environment* (or put a literal `password:` in `config.yaml` and
+   restrict the file's permissions).
 
-3. **Install dependencies**.
+Then set your router's DHCP DNS option (or each device's DNS server) to the
+machine running FaithFilter. Port 53 must be reachable from your clients
+and requires root to bind.
 
-   Update system packages and install Python and pip:
+> **Important:** make sure clients cannot simply switch to another DNS
+> server. On most routers you can add a firewall rule that blocks outbound
+> UDP/TCP port 53 (and port 853 for DNS-over-TLS) from the LAN except from
+> the FaithFilter host, and disable/redirect DNS-over-HTTPS in browsers via
+> policy where possible.
 
-   ```sh
-   apt update && apt upgrade -y
-   apt install -y python3 python3-pip git
-   ```
+## Configuration overview
 
-4. **Download FaithFilter**.
+Every setting has a built-in default (see `DEFAULT_CONFIG` in
+`faithfilter.py`), so `config.yaml` is optional and only needs the keys you
+want to change. The repository's `config.yaml` is a fully commented
+reference of every option; the highlights:
 
-   You can clone the repository or copy the provided files.  On your
-   server run:
+### Blocking individual sites
 
-   ```sh
-   # Clone the repository (replace with your own Git URL if you host it)
-   git clone https://example.com/faithfilter.git
-   cd faithfilter
-   ```
+Add domains to `blocklist.txt` (one per line), call
+`POST /api/blocklist {"domain": "example.com"}`, or hit `/api/reload` after
+editing the file. `whitelist.txt` overrides every blocklist.
 
-   Alternatively, upload the contents of the `faithfilter` folder in
-   this package to your server.
+### Blocklist sources (local or online)
 
-5. **Install Python packages**.
+```yaml
+blocking:
+  sources:
+    - name: "adult-content"
+      category: "adult"       # blocked AND reported weekly
+      url: "https://raw.githubusercontent.com/StevenBlack/hosts/master/alternates/porn-only/hosts"
+    - name: "ads-and-trackers"
+      category: "ads"         # blocked silently
+      url: "https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts"
+    - name: "my-extra-list"
+      category: "custom"
+      file: "/etc/faithfilter/extra.txt"   # local file source
+  refresh_hours: 24
+```
 
-   Use `pip` to install the requirements into a virtual environment or
-   system‑wide:
+Sources are re-downloaded every `refresh_hours` and cached in
+`lists_cache/`, so a temporary outage never empties your blocklists.
+Millions of entries are fine — lookups are hash-based.
 
-   ```sh
-   pip3 install --upgrade pip
-   pip3 install -r requirements.txt
-   ```
+### Monitoring and keywords
 
-6. **Review and edit `config.yaml`**.
+```yaml
+monitoring:
+  adult_keywords_enabled: true      # built-in adult keyword scan
+  extra_keywords: ["casino"]        # your own keywords
+  keywords_file: "keywords.txt"     # ...or keep them in a file
+  keyword_exceptions: []            # suppress false positives
+  block_keyword_matches: false      # false = record only, true = block too
+```
 
-   The supplied `config.yaml` controls listening IP/port, upstream
-   resolvers, logging, SafeSearch/YouTube options and the HTTP API.  At
-   minimum, verify that `listen_ip` is set to `0.0.0.0` and
-   `listen_port` is `53` (the standard DNS port).  Ensure `safe_search`
-   is `true` and choose a `youtube_mode` (`off`, `moderate` or
-   `strict`).  The default upstream DNS servers are Cloudflare and
-   Google Public DNS; adjust these if you prefer another resolver.
+A query triggers an alert when the domain is on an `adult` source, or when
+it contains a monitored keyword. Alerts are throttled (one per
+client/domain per 5 minutes) and stored in `logs/alerts.jsonl`.
 
-7. **Populate your blocklist**.
+### Weekly e-mail report
 
-   The `blocklist.txt` file contains only a few placeholder domains.
-   To effectively block adult content you should subscribe to a large
-   community list.  For example, the unified porn blocklist by
-   *columndeeply* merges more than 12 million domains and splits the
-   list into manageable chunks【733584132698443†L0-L27】.  You can
-   download one or more of these lists and append them to your
-   `blocklist.txt`:
+```yaml
+email:
+  enabled: true
+  smtp_host: "smtp.gmail.com"
+  smtp_port: 587
+  use_tls: true
+  username: "you@gmail.com"
+  password_env: "FAITHFILTER_SMTP_PASSWORD"   # export before starting
+  from: "FaithFilter <you@gmail.com>"
+  to: ["you@gmail.com"]
+  report_day: "sunday"
+  report_hour: 8            # UTC
+  send_if_empty: true
+```
 
-   ```sh
-   curl -s https://raw.githubusercontent.com/columndeeply/hosts/main/hosts00 >> blocklist.txt
-   curl -s https://raw.githubusercontent.com/columndeeply/hosts/main/hosts01 >> blocklist.txt
-   # Repeat for hosts02…hosts05 as desired
-   ```
+For Gmail, create an [App Password](https://myaccount.google.com/apppasswords)
+and export it: `export FAITHFILTER_SMTP_PASSWORD='xxxx xxxx xxxx xxxx'`.
+Preview the pending report at `GET /api/report/preview`, or send one
+immediately with `python3 faithfilter.py --config config.yaml --send-report`
+(or `POST /api/report/send`).
 
-   Remember that blocklist entries override the whitelist.  If you find
-   legitimate sites being blocked, add them to `whitelist.txt`.
+### Safe search / restricted mode
 
-8. **Run FaithFilter**.
+```yaml
+safe_search:
+  google: true         # SafeSearch VIP, covers google.com + regional TLDs
+  bing: true           # strict.bing.com
+  duckduckgo: true     # safe.duckduckgo.com
+  youtube: "strict"    # "off" | "moderate" | "strict"
+  custom_rewrites:     # any other service with a safe DNS endpoint
+    - name: "pixabay"
+      domains: ["pixabay.com", "www.pixabay.com"]
+      target: "safesearch.pixabay.com"
+      fallback_ip: "104.18.20.183"
+```
 
-   Start the service with root privileges (port 53 requires elevated
-   rights).  From the `faithfilter` directory, run:
+The restricted endpoint is resolved through your upstream DNS and cached;
+if resolution fails, the documented `fallback_ip` keeps enforcement
+working.
 
-   ```sh
-   sudo python3 faithfilter.py --config config.yaml
-   ```
+## Dashboard and HTTP API
 
-   You should see log messages indicating that the DNS server is
-   listening on port 53 and, if enabled, that the HTTP API is running on
-   port 5000.  Leave this terminal open to watch log output or run
-   FaithFilter inside a **tmux** session or as a background service.
+Browse to `http://<server>:5000` and sign in. The password comes from
+`http_api.password`, or — if left empty — is **auto-generated on first run**
+and stored in `admin_password.txt` next to the config (the log says where).
+Set `http_api.host: "0.0.0.0"` to reach the dashboard from other devices on
+your LAN.
 
-9. **Point your devices to FaithFilter**.
+The dashboard shows live stats, recent queries and alerts, manages the
+blocklist/whitelist/keywords, lists unblock requests (one click to
+whitelist), downloads backups, refreshes sources and sends a test e-mail.
 
-   Configure the DHCP server on your router to hand out the IP address
-   of your Vultr instance as the primary DNS server.  Alternatively,
-   manually set the DNS server on individual devices to your Vultr
-   server’s IP address.  Once clients are using FaithFilter, queries to
-   adult domains will be blocked and Google/YouTube will be filtered
-   according to your settings.
+The JSON API requires either a logged-in session or an `X-API-Key` header
+(`http_api.api_key`):
 
-## Optional: Running as a Systemd Service
+| Endpoint | Method | Description |
+|---|---|---|
+| `/api/status` | GET | Stats, list sizes, cache stats, refresh health. |
+| `/api/health` | GET | Plain-text health summary. |
+| `/api/queries?limit=N` | GET | Recent queries (time, client, domain, action). |
+| `/api/alerts?days=N` | GET | Monitoring alerts from the last N days (default 7). |
+| `/api/blocklist` | GET/POST | View personal blocklist / add `{"domain": ...}`. |
+| `/api/blocklist/<domain>` | DELETE | Remove from personal blocklist. |
+| `/api/whitelist` | GET/POST | Same, for the whitelist. |
+| `/api/whitelist/<domain>` | DELETE | Remove from whitelist. |
+| `/api/keywords` | GET/POST | View monitored keywords / add `{"keyword": ...}`. |
+| `/api/unblock-requests` | GET | Unblock requests submitted via the block page. |
+| `/api/reload` | POST | Reload local files (blocklist, whitelist, keywords). |
+| `/api/refresh` | POST | Re-download online sources now. |
+| `/api/report/preview` | GET | Plain-text preview of the pending weekly report. |
+| `/api/report/send` | POST | Send the report immediately. |
+| `/api/test-email` | POST | Send a test e-mail to verify SMTP settings. |
+| `/api/backup` | GET | Download config + lists as a zip. |
+| `/api/restore` | POST | Restore from a backup zip (multipart field `backup`). |
+| `/api/clients` | GET | Devices seen recently: names, today's counters, overrides. |
+| `/api/trends?days=N` | GET | Per-day, per-device statistics (default 30 days). |
+| `/api/overrides` | GET | Active pause/unfiltered overrides. |
+| `/api/override` | POST | `{"client": ip, "mode": "pause"\|"unfiltered", "minutes": N}`. |
+| `/api/override/<client>` | DELETE | Cancel a device's override ("resume"). |
+| `/dns-query` | GET/POST | DNS-over-HTTPS (RFC 8484); no auth required. |
 
-To keep FaithFilter running continuously and restart it on boot,
-create a systemd unit file at `/etc/systemd/system/faithfilter.service`:
+## How a query is handled
+
+1. **Device policy** — the client's group decides everything that follows:
+   `off` forwards immediately, `monitor_only` records but never blocks,
+   `full` (default) blocks and records. An active **curfew** blocks the
+   query outright.
+2. **Canaries** — `use-application-dns.net` and the iCloud Private Relay
+   hosts get NXDOMAIN so devices keep using this resolver.
+3. **Whitelist** — whitelisted domains (and subdomains) bypass every filter
+   and are forwarded upstream.
+4. **Safe search** — queries for enforced services are answered with the
+   provider's restricted endpoint; AAAA queries return empty.
+5. **Blocklists** — personal list (plain domains, `*wildcards*` and
+   `/regex/` rules) and all sources, with subdomain matching. `adult` and
+   `bypass` hits raise alerts; the client gets NXDOMAIN, `0.0.0.0`, or the
+   block page depending on configuration.
+6. **Keywords** — remaining domains are scanned for monitored keywords;
+   matches raise an alert and are optionally blocked.
+7. **Forward + CNAME check** — everything else is answered from the TTL
+   cache or the upstream servers (stale cache entries are served if all
+   upstreams are down), and responses whose CNAME chain leads to a blocked
+   domain are blocked.
+
+Every query is logged to `logs/queries.log` (rotated by size).
+
+## Per-device policies, curfews and the block page
+
+Give the kids' devices DHCP reservations on your router, name them, then
+group them:
+
+```yaml
+clients:
+  names:
+    "192.168.1.20": "Emma's iPad"
+    "192.168.1.10": "Dad's laptop"
+  groups:
+    - name: "kids"
+      members: ["192.168.1.20", "192.168.1.21"]
+      filtering: "full"
+      safe_search: true
+      curfew:
+        - days: ["sun", "mon", "tue", "wed", "thu"]
+          from: "21:30"
+          to: "06:30"
+    - name: "parents"
+      members: ["192.168.1.10"]
+      filtering: "off"
+
+block_page:
+  enabled: true      # blocked sites show a "site blocked" page with an
+  port: 80           # unblock-request form instead of a dead connection
+```
+
+## Running as a systemd service
+
+`/etc/systemd/system/faithfilter.service`:
 
 ```ini
 [Unit]
@@ -190,94 +358,103 @@ Description=FaithFilter DNS filtering service
 After=network.target
 
 [Service]
-ExecStart=/usr/bin/python3 /path/to/faithfilter/faithfilter.py --config /path/to/faithfilter/config.yaml
+ExecStart=/usr/bin/python3 /opt/faithfilter/faithfilter.py --config /opt/faithfilter/config.yaml
+WorkingDirectory=/opt/faithfilter
+Environment=FAITHFILTER_SMTP_PASSWORD=your-app-password
 Restart=always
 User=root
-WorkingDirectory=/path/to/faithfilter
-StandardOutput=syslog
-StandardError=syslog
-SyslogIdentifier=faithfilter
 
 [Install]
 WantedBy=multi-user.target
 ```
 
-Then reload systemd, enable and start the service:
-
 ```sh
 sudo systemctl daemon-reload
-sudo systemctl enable faithfilter.service
-sudo systemctl start faithfilter.service
+sudo systemctl enable --now faithfilter.service
+journalctl -u faithfilter -f
 ```
 
-Logs will be available via `journalctl -u faithfilter -f`.
+## Testing
 
-## HTTP API Usage
+```sh
+python3 test_faithfilter.py          # offline suite, no internet needed
+python3 faithfilter.py --config test_config.yaml   # manual run on :5353
+dig @127.0.0.1 -p 5353 exampleadult1.com           # → NXDOMAIN
+dig @127.0.0.1 -p 5353 www.google.com              # → SafeSearch VIP
+```
 
-If `http_api.enable` is set to `true` and Flask is installed, FaithFilter
-exposes several JSON endpoints.  The API is unauthenticated in the
-alpha release; you should restrict access using a firewall or reverse
-proxy.
+## Second server on a Raspberry Pi (no single point of failure)
 
-| Endpoint | Method | Description |
-|---|---|---|
-| `/api/status` | GET | Returns basic statistics such as total queries handled, number of blocked domains, and counts of SafeSearch and YouTube rewrites. |
-| `/api/queries?limit=N` | GET | Returns the last *N* queries recorded in memory (default 100). Each entry includes a timestamp, client IP, domain and action. |
-| `/api/blocklist` | GET | Returns the current blocklist loaded in memory. |
-| `/api/blocklist` | POST | Add a new domain to the blocklist. Body must be JSON: `{ "domain": "example.com" }`. The domain is appended to the blocklist file. |
-| `/api/blocklist/<domain>` | DELETE | Remove a domain from the blocklist. |
-| `/api/whitelist` | GET/POST | Same semantics as `/api/blocklist` but for the whitelist. |
-| `/api/whitelist/<domain>` | DELETE | Remove a domain from the whitelist. |
-| `/api/reload` | POST | Reload blocklist and whitelist from disk. Useful after manually editing the files. |
+If the FaithFilter box dies, home DNS dies with it. The fix is a cheap
+second server — a **Raspberry Pi Zero 2 W** (~$15) is plenty — handed out
+as DNS 2 by the router. Follower mode keeps its lists identical to the
+primary automatically.
 
-## How It Works
+1. **On the primary**, set an API key in `config.yaml` and restart:
+   ```yaml
+   http_api:
+     host: "0.0.0.0"          # the Pi must be able to reach it
+     api_key: "pick-a-long-random-string"
+   ```
+2. **Flash the Pi** with Raspberry Pi OS Lite **64-bit** (Zero 2 W, Pi 3/4/5).
+   Give it a static IP / DHCP reservation (example: `192.168.1.54`).
+3. **Install FaithFilter on the Pi** — either download the
+   `faithfilter-linux-arm64` build:
+   ```sh
+   sudo mkdir -p /opt/faithfilter && cd /opt/faithfilter
+   # copy the 'faithfilter' binary here, then:
+   sudo chmod +x faithfilter
+   ```
+   or, on a 32-bit original Pi Zero/Pi 1 (ARMv6 — no prebuilt binary), run
+   from source instead:
+   ```sh
+   sudo apt install -y python3-pip git
+   git clone https://github.com/bdscherer/dns.git /opt/faithfilter
+   pip3 install -r /opt/faithfilter/requirements.txt
+   ```
+4. **Configure the Pi as a follower** — `/opt/faithfilter/config.yaml`:
+   ```yaml
+   sync:
+     enabled: true
+     primary_url: "http://192.168.1.53:5000"   # the primary's dashboard
+     api_key: "pick-a-long-random-string"      # same value as step 1
+     interval_minutes: 60
+   email:
+     enabled: false        # only the primary sends reports/alerts
+   ```
+   Blocklist *sources* download independently on the Pi; the sync pulls
+   your personal blocklist, whitelist and keywords so edits on the
+   primary's dashboard reach the Pi within the hour. Client groups and
+   curfews live in `config.yaml` — copy that section over once, or set
+   `include_config: true` to mirror the whole config (the follower
+   automatically re-applies its own `sync:` section after each pull so
+   the mirroring can't disable itself).
+5. **Free port 53 and install the service** (same as the primary):
+   ```sh
+   sudo ./faithfilter --install-service      # or via python3 faithfilter.py
+   ```
+6. **On the router**, set **DNS 1** = primary IP, **DNS 2** = Pi IP.
+   Devices will use the Pi automatically whenever the primary is down —
+   and it enforces the same rules, so an outage never becomes an
+   unfiltered window.
 
-When a DNS request arrives, FaithFilter inspects the query name and
-applies the following logic in order:
+## Installing as a service in one command
 
-1. **Whitelist check** – if the domain or any of its parent domains
-   appears in `whitelist.txt`, the request is forwarded directly to
-   the upstream resolvers and the response is relayed back to the
-   client.
-2. **Google SafeSearch** – if SafeSearch is enabled and the query is
-   for a Google search domain (for example `google.com` or
-   `www.google.com`), FaithFilter returns a response pointing to
-   Google’s SafeSearch VIP address.  According to Google’s
-   documentation, mapping Google domains to `forcesafesearch.google.com`
-   forces SafeSearch for all browsers and cannot be disabled by end
-   users【981322123641601†L65-L160】.
-3. **YouTube restricted mode** – if `youtube_mode` is set to `moderate`
-   or `strict`, queries for YouTube domains (such as
-   `www.youtube.com`, `youtube.googleapis.com` and their sub‑domains)
-   are rewritten to one of Google’s restricted IP addresses:
-   `216.239.38.119` for moderate mode and `216.239.38.120` for strict
-   mode【15477614038885†L90-L106】.
-4. **Blocklist check** – if the domain (or any parent domain) is
-   present in `blocklist.txt`, FaithFilter responds with
-   *NXDOMAIN* (a non‑existent domain error).  You can modify this
-   behaviour in the code to return a sinkhole IP if you prefer.
-5. **Forwarding** – all remaining queries are forwarded to the list of
-   upstream DNS servers defined in `config.yaml`.  The first server to
-   answer is used.  If all upstreams fail, FaithFilter returns a
-   SERVFAIL response to the client.
+```sh
+sudo ./faithfilter --install-service      # Linux: systemd unit, enabled + started
+faithfilter.exe --install-service        # Windows (admin): boot-time Scheduled Task
+```
 
-Throughout this process every query is logged with its outcome.  The
-log file can be rotated using standard log management tools or read by
-the HTTP API.
+## Notes and limitations
 
-## Next Steps
-
-This alpha release provides the core functionality needed to filter
-adult content at the DNS layer.  There are many opportunities for
-improvement, including:
-
-- Implementing TLS for encrypted DNS (DoH/DoT) so that clients can
-  communicate securely with the filter.
-- Providing a web dashboard for visualising logs and adjusting
-  settings.
-- Integrating automatic updates of external blocklists.
-- Adding authentication to the HTTP API.
-
-Please report bugs or contribute improvements via the project’s issue
-tracker.  Together we can make the internet a safer place for
-families.
+- The bypass blocklist, canary NXDOMAINs and CNAME checks make evasion much
+  harder, but a determined user with a device you don't control can still
+  hard-code an IP or use cellular data. Router firewall rules that force
+  LAN port 53/853 through this server remain worthwhile.
+- Keyword scanning sees only *domain names*, not page content or search
+  terms inside URLs.
+- The block page can't suppress the browser certificate warning on HTTPS
+  sites — that is inherent to DNS-level blocking.
+- Serving DoH/DoT to phones outside your network requires a public
+  hostname with a real TLS certificate (e.g. Let's Encrypt) and forwarding
+  the relevant ports; keep the dashboard itself off the public internet.
