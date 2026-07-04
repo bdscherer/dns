@@ -45,6 +45,7 @@ import re
 import secrets
 import smtplib
 import socket
+import sqlite3
 import ssl
 import subprocess
 import sys
@@ -61,6 +62,8 @@ from urllib.parse import parse_qs, urlparse
 import yaml
 from dnslib import A, AAAA, DNSRecord, QTYPE, RCODE, RR
 from dnslib.server import BaseResolver, DNSLogger, DNSServer
+
+__version__ = "2.1.0"
 
 try:
     # Flask is optional; the service still runs in DNS-only mode when the
@@ -120,6 +123,13 @@ DEFAULT_CONFIG: Dict = {
         "cache_dir": "lists_cache",
     },
     "clients": {
+        # Friendly names for devices, shown in reports and the dashboard:
+        #   names:
+        #     "192.168.1.20": "Emma's iPad"
+        "names": {},
+        # Temporary pause/unfiltered overrides are persisted here so they
+        # survive a restart.
+        "overrides_file": "logs/overrides.json",
         # Per-device policy groups. Clients not matching any group use the
         # implicit defaults (full filtering, safe search on, no curfew).
         #
@@ -156,6 +166,8 @@ DEFAULT_CONFIG: Dict = {
         "keyword_exceptions": [],
         "block_keyword_matches": False,
         "alert_log_file": "logs/alerts.jsonl",
+        # Alerts and unblock requests older than this are purged daily.
+        "alert_retention_days": 90,
     },
     "safe_search": {
         "google": True,
@@ -176,14 +188,44 @@ DEFAULT_CONFIG: Dict = {
         "to": [],
         "report_day": "sunday",
         "report_hour": 8,
+        # "local" schedules the report in the server's local time zone;
+        # "utc" keeps the old behaviour. Curfews are always local time.
+        "report_timezone": "local",
         "send_if_empty": True,
         "state_file": "logs/report_state.json",
+    },
+    "stats": {
+        # Long-term per-device statistics (SQLite) powering the dashboard
+        # trends view and week-over-week lines in the report.
+        "enabled": True,
+        "db_file": "logs/stats.db",
+        "retention_days": 365,
+    },
+    "updates": {
+        # Check GitHub daily for a newer tagged release; surfaces on the
+        # dashboard and in the weekly report (never auto-installs).
+        "check": True,
+        "repo": "bdscherer/dns",
+    },
+    "sync": {
+        # Follower mode for a secondary server (e.g. a Raspberry Pi):
+        # periodically pulls blocklist/whitelist/keywords from the primary's
+        # /api/backup endpoint so both servers enforce the same rules.
+        # Requires http_api.api_key to be set on the primary.
+        "enabled": False,
+        "primary_url": "",         # e.g. "http://192.168.1.53:5000"
+        "api_key": "",
+        "interval_minutes": 60,
+        "include_config": False,   # also pull config.yaml (restart needed)
     },
     "logs": {
         "query_log_file": "logs/queries.log",
         "log_level": "INFO",
         "max_log_mb": 20,      # rotate query/alert logs beyond this size
         "log_backups": 3,      # rotated copies to keep (.1, .2, ...)
+        # Auto-delete rotated query logs older than this many days;
+        # alert/unblock entries use monitoring.alert_retention_days.
+        "retention_days": 30,
     },
     "http_api": {
         "enable": True,
@@ -884,6 +926,457 @@ class ClientPolicies:
 
 
 # ---------------------------------------------------------------------------
+# Temporary per-device overrides ("pause internet" / "bonus time")
+# ---------------------------------------------------------------------------
+
+class Overrides:
+    """Time-limited per-client overrides, persisted across restarts.
+
+    Modes:
+      "pause"      - block ALL internet access for the device
+      "unfiltered" - disable every filter for the device
+    """
+
+    MODES = ("pause", "unfiltered")
+
+    def __init__(self, path: str, logger: logging.Logger):
+        self.path = path
+        self.logger = logger
+        self._lock = threading.Lock()
+        self._entries: Dict[str, Dict] = {}
+        try:
+            if path and os.path.exists(path):
+                with open(path, "r", encoding="utf-8") as f:
+                    self._entries = json.load(f)
+        except (OSError, ValueError):
+            self._entries = {}
+
+    def _save(self) -> None:
+        try:
+            if os.path.dirname(self.path):
+                os.makedirs(os.path.dirname(self.path), exist_ok=True)
+            with open(self.path, "w", encoding="utf-8") as f:
+                json.dump(self._entries, f)
+        except OSError as exc:
+            self.logger.error("Could not persist overrides: %s", exc)
+
+    def set(self, client: str, mode: str, minutes: float) -> Dict:
+        if mode not in self.MODES:
+            raise ValueError(f"mode must be one of {self.MODES}")
+        until = (datetime.datetime.now(datetime.timezone.utc)
+                 + datetime.timedelta(minutes=minutes))
+        entry = {"mode": mode, "until": until.isoformat()}
+        with self._lock:
+            self._entries[client] = entry
+            self._save()
+        return {"client": client, **entry}
+
+    def cancel(self, client: str) -> bool:
+        with self._lock:
+            if client in self._entries:
+                del self._entries[client]
+                self._save()
+                return True
+        return False
+
+    def active(self, client: str) -> Optional[str]:
+        """Return the active mode for a client, pruning expired entries."""
+        with self._lock:
+            entry = self._entries.get(client)
+            if not entry:
+                return None
+            try:
+                until = datetime.datetime.fromisoformat(entry["until"])
+            except (ValueError, KeyError):
+                del self._entries[client]
+                self._save()
+                return None
+            if datetime.datetime.now(datetime.timezone.utc) >= until:
+                del self._entries[client]
+                self._save()
+                return None
+            return entry["mode"]
+
+    def list(self) -> List[Dict]:
+        now = datetime.datetime.now(datetime.timezone.utc)
+        result = []
+        with self._lock:
+            for client, entry in self._entries.items():
+                try:
+                    until = datetime.datetime.fromisoformat(entry["until"])
+                except (ValueError, KeyError):
+                    continue
+                if until > now:
+                    result.append({"client": client, "mode": entry["mode"],
+                                   "until": entry["until"]})
+        return result
+
+
+# ---------------------------------------------------------------------------
+# Long-term statistics (SQLite)
+# ---------------------------------------------------------------------------
+
+class StatsDB:
+    """Per-day, per-device counters for trends and week-over-week lines.
+
+    Queries increment in-memory counters that a background thread flushes
+    to SQLite, so the hot path never touches the disk.
+    """
+
+    def __init__(self, db_file: str, logger: logging.Logger,
+                 flush_interval: float = 30.0):
+        self.logger = logger
+        self._lock = threading.Lock()
+        self._pending: Dict[Tuple[str, str, str], int] = {}
+        self._stop = threading.Event()
+        if os.path.dirname(db_file):
+            os.makedirs(os.path.dirname(db_file), exist_ok=True)
+        self._db = sqlite3.connect(db_file, check_same_thread=False)
+        self._db.execute(
+            "CREATE TABLE IF NOT EXISTS stats ("
+            " day TEXT NOT NULL, client TEXT NOT NULL, kind TEXT NOT NULL,"
+            " count INTEGER NOT NULL DEFAULT 0,"
+            " PRIMARY KEY (day, client, kind))")
+        self._db.commit()
+        if flush_interval > 0:
+            threading.Thread(target=self._flush_loop, args=(flush_interval,),
+                             name="stats-flush", daemon=True).start()
+
+    @staticmethod
+    def _kind_for(action: str) -> Optional[str]:
+        if action.startswith("blocked"):
+            return "blocked"
+        if action.startswith("flagged"):
+            return "flagged"
+        return None
+
+    def record(self, client: str, action: str) -> None:
+        day = datetime.date.today().isoformat()
+        with self._lock:
+            self._pending[(day, client, "total")] = \
+                self._pending.get((day, client, "total"), 0) + 1
+            kind = self._kind_for(action)
+            if kind:
+                self._pending[(day, client, kind)] = \
+                    self._pending.get((day, client, kind), 0) + 1
+
+    def flush(self) -> None:
+        with self._lock:
+            pending, self._pending = self._pending, {}
+            if not pending:
+                return
+            try:
+                for (day, client, kind), count in pending.items():
+                    self._db.execute(
+                        "INSERT INTO stats (day, client, kind, count) "
+                        "VALUES (?, ?, ?, ?) "
+                        "ON CONFLICT(day, client, kind) "
+                        "DO UPDATE SET count = count + excluded.count",
+                        (day, client, kind, count))
+                self._db.commit()
+            except sqlite3.Error as exc:
+                self.logger.error("Stats flush failed: %s", exc)
+
+    def _flush_loop(self, interval: float) -> None:
+        while not self._stop.wait(interval):
+            self.flush()
+
+    def trends(self, days: int = 30) -> List[Dict]:
+        """Per-day, per-client counters for the last N days."""
+        self.flush()
+        since = (datetime.date.today()
+                 - datetime.timedelta(days=days - 1)).isoformat()
+        with self._lock:
+            rows = self._db.execute(
+                "SELECT day, client, kind, count FROM stats "
+                "WHERE day >= ? ORDER BY day", (since,)).fetchall()
+        merged: Dict[Tuple[str, str], Dict] = {}
+        for day, client, kind, count in rows:
+            entry = merged.setdefault((day, client),
+                                      {"day": day, "client": client,
+                                       "total": 0, "blocked": 0, "flagged": 0})
+            entry[kind] = count
+        return list(merged.values())
+
+    def totals_between(self, start: datetime.date,
+                       end: datetime.date) -> Dict[str, int]:
+        """Summed total/blocked counters for [start, end)."""
+        self.flush()
+        with self._lock:
+            rows = self._db.execute(
+                "SELECT kind, SUM(count) FROM stats "
+                "WHERE day >= ? AND day < ? GROUP BY kind",
+                (start.isoformat(), end.isoformat())).fetchall()
+        return {kind: total or 0 for kind, total in rows}
+
+    def purge(self, retention_days: int) -> None:
+        cutoff = (datetime.date.today()
+                  - datetime.timedelta(days=retention_days)).isoformat()
+        with self._lock:
+            self._db.execute("DELETE FROM stats WHERE day < ?", (cutoff,))
+            self._db.commit()
+
+    def stop(self) -> None:
+        self._stop.set()
+        self.flush()
+
+
+# ---------------------------------------------------------------------------
+# Update checker
+# ---------------------------------------------------------------------------
+
+class UpdateChecker:
+    """Checks GitHub once a day for a newer tagged release.
+
+    Never installs anything; the result is shown on the dashboard and in
+    the weekly report's health section.
+    """
+
+    def __init__(self, config: Dict, logger: logging.Logger):
+        cfg = config.get("updates", {})
+        self.enabled = bool(cfg.get("check", True))
+        self.repo = cfg.get("repo", "bdscherer/dns")
+        self.logger = logger
+        self.latest_version: Optional[str] = None
+        self.update_available = False
+        self._stop = threading.Event()
+
+    @staticmethod
+    def _as_tuple(version: str) -> Tuple:
+        parts = []
+        for piece in version.lstrip("vV").split("."):
+            digits = "".join(ch for ch in piece if ch.isdigit())
+            parts.append(int(digits) if digits else 0)
+        return tuple(parts)
+
+    def check_once(self) -> None:
+        url = f"https://api.github.com/repos/{self.repo}/releases/latest"
+        try:
+            req = urllib.request.Request(
+                url, headers={"User-Agent": "FaithFilter/" + __version__,
+                              "Accept": "application/vnd.github+json"})
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                tag = json.load(resp).get("tag_name", "")
+        except Exception:
+            return  # no releases yet, rate-limited, or offline: stay quiet
+        if not tag:
+            return
+        self.latest_version = tag.lstrip("vV")
+        self.update_available = (self._as_tuple(tag)
+                                 > self._as_tuple(__version__))
+        if self.update_available:
+            self.logger.info("A newer FaithFilter release is available: %s "
+                             "(running %s)", self.latest_version, __version__)
+
+    def start(self) -> None:
+        if not self.enabled:
+            return
+
+        def loop() -> None:
+            self.check_once()
+            while not self._stop.wait(86400):
+                self.check_once()
+
+        threading.Thread(target=loop, name="update-check", daemon=True).start()
+
+    def stop(self) -> None:
+        self._stop.set()
+
+
+# ---------------------------------------------------------------------------
+# Data retention
+# ---------------------------------------------------------------------------
+
+def _prune_jsonl_by_age(path: str, max_age_days: float) -> None:
+    """Rewrite a JSONL file keeping only entries newer than the cutoff."""
+    if not path or not os.path.exists(path):
+        return
+    cutoff = (datetime.datetime.now(datetime.timezone.utc)
+              - datetime.timedelta(days=max_age_days))
+    kept: List[str] = []
+    with open(path, "r", encoding="utf-8", errors="ignore") as f:
+        for line in f:
+            try:
+                ts = datetime.datetime.fromisoformat(json.loads(line)["time"])
+                if ts >= cutoff:
+                    kept.append(line)
+            except (ValueError, KeyError):
+                continue
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.writelines(kept)
+    os.replace(tmp, path)
+
+
+def purge_old_data(config: Dict, stats: Optional[StatsDB],
+                   logger: logging.Logger) -> None:
+    """Apply the retention policy: browsing history is sensitive, so old
+    logs are deleted rather than kept forever."""
+    log_days = float(config.get("logs", {}).get("retention_days", 30))
+    query_log = config.get("logs", {}).get("query_log_file")
+    if query_log and log_days > 0:
+        cutoff = time.time() - log_days * 86400
+        directory = os.path.dirname(query_log) or "."
+        base = os.path.basename(query_log)
+        try:
+            for name in os.listdir(directory):
+                if name.startswith(base + "."):
+                    full = os.path.join(directory, name)
+                    if os.path.getmtime(full) < cutoff:
+                        os.remove(full)
+                        logger.info("Retention: removed old log %s", full)
+        except OSError as exc:
+            logger.warning("Retention sweep failed: %s", exc)
+
+    alert_days = float(config.get("monitoring", {}).get(
+        "alert_retention_days", 90))
+    if alert_days > 0:
+        try:
+            _prune_jsonl_by_age(config.get("monitoring", {}).get(
+                "alert_log_file"), alert_days)
+            _prune_jsonl_by_age(config.get("block_page", {}).get(
+                "unblock_requests_file"), alert_days)
+        except OSError as exc:
+            logger.warning("Alert retention failed: %s", exc)
+
+    if stats:
+        stats.purge(int(config.get("stats", {}).get("retention_days", 365)))
+
+
+# ---------------------------------------------------------------------------
+# Backup application and follower sync (secondary server support)
+# ---------------------------------------------------------------------------
+
+BACKUP_MEMBERS = ("config.yaml", "blocklist.txt", "whitelist.txt",
+                  "keywords.txt")
+
+
+def backup_targets(config: Dict) -> Dict[str, Optional[str]]:
+    blocking = config.get("blocking", {})
+    return {
+        "config.yaml": config.get("_config_path"),
+        "blocklist.txt": blocking.get("my_blocklist"),
+        "whitelist.txt": blocking.get("whitelist"),
+        "keywords.txt": config.get("monitoring", {}).get("keywords_file"),
+    }
+
+
+def apply_backup_zip(data: bytes, config: Dict,
+                     include_config: bool = True) -> List[str]:
+    """Write the recognised members of a backup zip to their configured
+    locations.  Returns the list of restored file names."""
+    targets = backup_targets(config)
+    restored: List[str] = []
+    with zipfile.ZipFile(io.BytesIO(data)) as zf:
+        for arcname in zf.namelist():
+            if arcname not in BACKUP_MEMBERS:
+                continue
+            if arcname == "config.yaml" and not include_config:
+                continue
+            path = targets.get(arcname)
+            if not path:
+                continue
+            if os.path.dirname(path):
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "wb") as f:
+                f.write(zf.read(arcname))
+            restored.append(arcname)
+    return restored
+
+
+class SyncFollower:
+    """Keeps a secondary server's lists in step with the primary.
+
+    Pulls the primary's /api/backup (authenticated with an API key) on an
+    interval and applies blocklist/whitelist/keywords locally, so a
+    Raspberry Pi running as DNS 2 enforces the same rules as DNS 1.
+    """
+
+    def __init__(self, config: Dict, resolver: "FaithFilterResolver",
+                 logger: logging.Logger):
+        cfg = config.get("sync", {})
+        self.config = config
+        self.resolver = resolver
+        self.logger = logger
+        self.primary_url = str(cfg.get("primary_url", "")).rstrip("/")
+        self.api_key = cfg.get("api_key", "")
+        self.interval = max(5, float(cfg.get("interval_minutes", 60))) * 60
+        self.include_config = bool(cfg.get("include_config", False))
+        self.last_sync: Optional[datetime.datetime] = None
+        self.last_error: Optional[str] = None
+        self._stop = threading.Event()
+
+    def sync_once(self) -> bool:
+        try:
+            req = urllib.request.Request(
+                self.primary_url + "/api/backup",
+                headers={"X-API-Key": self.api_key,
+                         "User-Agent": "FaithFilter/" + __version__})
+            with urllib.request.urlopen(req, timeout=60) as resp:
+                data = resp.read()
+            restored = apply_backup_zip(data, self.config,
+                                        self.include_config)
+            if "config.yaml" in restored:
+                self._preserve_sync_section()
+            self.resolver.blocklists.reload(download=False)
+            self.resolver.keywords.reload()
+            self.last_sync = datetime.datetime.now(datetime.timezone.utc)
+            self.last_error = None
+            self.logger.info("Synced %s from primary %s",
+                             ", ".join(restored) or "nothing",
+                             self.primary_url)
+            return True
+        except Exception as exc:
+            self.last_error = str(exc)
+            self.logger.warning("Sync from primary failed: %s", exc)
+            return False
+
+    def _preserve_sync_section(self) -> None:
+        """Re-apply this follower's own sync settings after pulling the
+        primary's config.yaml, which would otherwise disable the sync on
+        the next restart (the primary has sync.enabled: false)."""
+        path = self.config.get("_config_path")
+        if not path or not os.path.exists(path):
+            return
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                pulled = yaml.safe_load(f) or {}
+            pulled["sync"] = {
+                "enabled": True,
+                "primary_url": self.primary_url,
+                "api_key": self.api_key,
+                "interval_minutes": self.interval / 60,
+                "include_config": self.include_config,
+            }
+            with open(path, "w", encoding="utf-8") as f:
+                yaml.safe_dump(pulled, f, default_flow_style=False,
+                               sort_keys=False)
+        except (OSError, yaml.YAMLError) as exc:
+            self.logger.warning("Could not preserve sync settings in "
+                                "pulled config: %s", exc)
+
+    def start(self) -> None:
+        if not self.primary_url:
+            self.logger.error("sync.enabled is true but sync.primary_url "
+                              "is not set")
+            return
+
+        def loop() -> None:
+            self.sync_once()
+            while not self._stop.wait(self.interval):
+                self.sync_once()
+
+        threading.Thread(target=loop, name="sync-follower",
+                         daemon=True).start()
+        self.logger.info("Follower sync enabled: pulling lists from %s "
+                         "every %d minutes",
+                         self.primary_url, int(self.interval / 60))
+
+    def stop(self) -> None:
+        self._stop.set()
+
+
+# ---------------------------------------------------------------------------
 # Keyword monitor
 # ---------------------------------------------------------------------------
 
@@ -1059,6 +1552,17 @@ class FaithFilterResolver(BaseResolver):
         self.keywords = KeywordMonitor(config, logger)
         self.safe_search = SafeSearchEngine(config, self._forward_query, logger)
         self.policies = ClientPolicies(config, logger)
+        clients_cfg = config.get("clients", {})
+        self.client_names: Dict[str, str] = {
+            str(ip): str(name)
+            for ip, name in (clients_cfg.get("names") or {}).items()}
+        self.overrides = Overrides(
+            clients_cfg.get("overrides_file", "logs/overrides.json"), logger)
+        stats_cfg = config.get("stats", {})
+        self.statsdb: Optional[StatsDB] = None
+        if stats_cfg.get("enabled", True):
+            self.statsdb = StatsDB(stats_cfg.get("db_file", "logs/stats.db"),
+                                   logger)
         self.notifier = Notifier(config, logger)
         self.notifications = config.get("notifications", {})
         self.blocklists.on_refresh_failure = self._refresh_failure_alert
@@ -1102,7 +1606,13 @@ class FaithFilterResolver(BaseResolver):
 
     # -- helpers --------------------------------------------------------------
 
+    def client_label(self, client_ip: str) -> str:
+        name = self.client_names.get(client_ip)
+        return f"{name} ({client_ip})" if name else client_ip
+
     def log_query(self, client_ip: str, domain: str, action: str) -> None:
+        if self.statsdb:
+            self.statsdb.record(client_ip, action)
         timestamp = datetime.datetime.now(datetime.timezone.utc).isoformat()
         entry = {"time": timestamp, "client": client_ip,
                  "domain": domain, "action": action}
@@ -1200,10 +1710,11 @@ class FaithFilterResolver(BaseResolver):
                 "instant_min_minutes", 60)) * 60
             kind = ("adult content" if reason == "adult_domain"
                     else "a filter-bypass service (VPN/proxy/DoH)")
+            label = self.client_label(client_ip)
             self.notifier.send_throttled(
                 f"instant:{client_ip}", interval,
-                f"FaithFilter alert: {client_ip} tried to reach {kind}",
-                f"Device {client_ip} attempted to access {domain} "
+                f"FaithFilter alert: {label} tried to reach {kind}",
+                f"Device {label} attempted to access {domain} "
                 f"({reason}: {detail}).\n\n"
                 "Further attempts from this device within the next hour are "
                 "throttled; the weekly report will contain the full list.")
@@ -1232,6 +1743,16 @@ class FaithFilterResolver(BaseResolver):
                      if hasattr(handler, "client_address") else "unknown")
         group = self.policies.group_for(client_ip)
         filtering = str(group.get("filtering", "full")).lower()
+
+        # Temporary overrides trump the group policy.
+        override = self.overrides.active(client_ip)
+        if override == "pause":
+            self.stats["blocked"] += 1
+            self.log_query(client_ip, qname, "blocked:paused")
+            return self._blocked_reply(request)
+        if override == "unfiltered":
+            filtering = "off"
+
         enforce = filtering == "full"          # blocking active
         monitor = filtering in ("full", "monitor_only")
 
@@ -1329,21 +1850,31 @@ WEEKDAYS = ["monday", "tuesday", "wednesday", "thursday", "friday",
 
 
 def build_report(alerts: List[Dict], period_start: datetime.datetime,
-                 period_end: datetime.datetime) -> str:
+                 period_end: datetime.datetime,
+                 names: Optional[Dict[str, str]] = None) -> str:
     """Render the weekly alert summary as plain text."""
+    names = names or {}
+
+    def label(client: str) -> str:
+        return (f"{names[client]} ({client})"
+                if client in names else client)
+
     lines = [
         "FaithFilter weekly activity report",
         f"Period: {period_start:%Y-%m-%d %H:%M} to {period_end:%Y-%m-%d %H:%M} UTC",
         "",
     ]
     if not alerts:
-        lines.append("No adult-content or keyword alerts were recorded this week.")
+        lines.append("No adult-content, bypass or keyword alerts were "
+                     "recorded this week.")
         return "\n".join(lines)
 
     adult = [a for a in alerts if a.get("reason") == "adult_domain"]
+    bypass = [a for a in alerts if a.get("reason") == "bypass_attempt"]
     keyword = [a for a in alerts if a.get("reason") == "keyword"]
     lines.append(f"Total alerts: {len(alerts)} "
-                 f"({len(adult)} adult-domain, {len(keyword)} keyword)")
+                 f"({len(adult)} adult-domain, {len(bypass)} bypass-attempt, "
+                 f"{len(keyword)} keyword)")
     lines.append("")
 
     def top(counter: Dict[str, int], n: int = 15) -> List[Tuple[str, int]]:
@@ -1352,10 +1883,19 @@ def build_report(alerts: List[Dict], period_start: datetime.datetime,
     by_client: Dict[str, int] = {}
     for a in alerts:
         by_client[a.get("client", "?")] = by_client.get(a.get("client", "?"), 0) + 1
-    lines.append("By device (client IP):")
+    lines.append("By device:")
     for client, count in top(by_client):
-        lines.append(f"  {client:<20} {count} attempt(s)")
+        lines.append(f"  {label(client):<34} {count} attempt(s)")
     lines.append("")
+
+    if bypass:
+        by_domain_b: Dict[str, int] = {}
+        for a in bypass:
+            by_domain_b[a["domain"]] = by_domain_b.get(a["domain"], 0) + 1
+        lines.append("Filter-bypass services requested (VPN/proxy/DoH):")
+        for domain, count in top(by_domain_b):
+            lines.append(f"  {domain:<45} {count}x")
+        lines.append("")
 
     if adult:
         by_domain: Dict[str, int] = {}
@@ -1376,7 +1916,7 @@ def build_report(alerts: List[Dict], period_start: datetime.datetime,
         lines.append("")
         lines.append("Keyword match details (up to 50):")
         for a in keyword[:50]:
-            lines.append(f"  {a['time'][:16]} {a.get('client', '?'):<16} "
+            lines.append(f"  {a['time'][:16]} {label(a.get('client', '?')):<24} "
                          f"{a['domain']} (keyword: {a.get('detail')})")
 
     return "\n".join(lines)
@@ -1387,12 +1927,16 @@ class Reporter:
 
     def __init__(self, config: Dict, alerts: AlertLog, logger: logging.Logger,
                  notifier: Optional[Notifier] = None,
-                 health_text: Optional[Callable[[], str]] = None):
+                 health_text: Optional[Callable[[], str]] = None,
+                 names: Optional[Dict[str, str]] = None,
+                 statsdb: Optional[StatsDB] = None):
         self.cfg = config.get("email", {})
         self.alerts = alerts
         self.logger = logger
         self.notifier = notifier or Notifier(config, logger)
         self.health_text = health_text
+        self.names = names or {}
+        self.statsdb = statsdb
         self.enabled = bool(self.cfg.get("enabled", False))
         self.state_file = self.cfg.get("state_file", "logs/report_state.json")
         self._stop = threading.Event()
@@ -1419,7 +1963,19 @@ class Reporter:
         now = datetime.datetime.now(datetime.timezone.utc)
         last = self._last_sent() or (now - datetime.timedelta(days=7))
         alerts = self.alerts.read_since(last)
-        body = build_report(alerts, last, now)
+        body = build_report(alerts, last, now, self.names)
+        if self.statsdb:
+            today = datetime.date.today()
+            this_week = self.statsdb.totals_between(
+                today - datetime.timedelta(days=7), today + datetime.timedelta(days=1))
+            prev_week = self.statsdb.totals_between(
+                today - datetime.timedelta(days=14),
+                today - datetime.timedelta(days=7))
+            body += ("\n\nWeek over week:\n"
+                     f"  Queries: {this_week.get('total', 0)} "
+                     f"(previous week {prev_week.get('total', 0)})\n"
+                     f"  Blocked: {this_week.get('blocked', 0)} "
+                     f"(previous week {prev_week.get('blocked', 0)})")
         if self.health_text:
             body += "\n\n" + self.health_text()
         return body, len(alerts)
@@ -1444,11 +2000,17 @@ class Reporter:
     def _due(self, now: datetime.datetime) -> bool:
         day = str(self.cfg.get("report_day", "sunday")).lower()
         hour = int(self.cfg.get("report_hour", 8))
+        # Schedule in server-local time by default so report_hour matches
+        # the clock on the wall (curfews are local too); "utc" opts out.
+        if str(self.cfg.get("report_timezone", "local")).lower() != "utc":
+            check = now.astimezone()
+        else:
+            check = now
         try:
             target_weekday = WEEKDAYS.index(day)
         except ValueError:
             target_weekday = 6
-        if now.weekday() != target_weekday or now.hour != hour:
+        if check.weekday() != target_weekday or check.hour != hour:
             return False
         last = self._last_sent()
         return last is None or (now - last) > datetime.timedelta(days=1)
@@ -1472,13 +2034,17 @@ class Reporter:
         self._stop.set()
 
 
-def build_health_text(resolver: "FaithFilterResolver") -> str:
+def build_health_text(resolver: "FaithFilterResolver",
+                      updates: Optional[UpdateChecker] = None) -> str:
     """Service-health section appended to the weekly report."""
     now = datetime.datetime.now(datetime.timezone.utc)
     uptime = now - resolver.start_time
     lists = resolver.blocklists.stats()
     lines = [
         "Filter health:",
+        f"  Version: {__version__}"
+        + (f" - UPDATE AVAILABLE: {updates.latest_version}"
+           if updates and updates.update_available else ""),
         f"  Uptime: {uptime.days}d {uptime.seconds // 3600}h "
         f"(started {resolver.start_time:%Y-%m-%d %H:%M} UTC)",
         f"  Queries handled: {resolver.stats['total_queries']} "
@@ -1730,8 +2296,17 @@ DASHBOARD_HTML = """<!DOCTYPE html><html><head><meta charset="utf-8">
  li button{padding:0 .45rem;font-size:.75rem;background:#dc2626}
  #msg{position:fixed;bottom:1rem;right:1rem;background:#111;color:#fff;
    padding:.6rem 1rem;border-radius:8px;display:none}
+ .bar{background:#e2e8f0;border-radius:4px;height:.6rem;overflow:hidden}
+ .bar i{display:block;height:100%;background:#2563eb}
+ .bar i.r{background:#dc2626}
+ .pill{background:#fef3c7;color:#92400e;border-radius:999px;
+   padding:.1rem .5rem;font-size:.75rem}
+ #ver{font-size:.75rem;opacity:.8;margin-left:.6rem}
+ .upd{background:#fbbf24;color:#111;border-radius:999px;padding:.1rem .5rem;
+   font-size:.75rem;margin-left:.4rem}
 </style></head><body>
-<header><h1>&#128737;&#65039; FaithFilter</h1>
+<header><h1>&#128737;&#65039; FaithFilter<span id="ver"></span><span id="upd">
+</span></h1>
 <div>
 <button class="ghost" onclick="act('/api/refresh')">Refresh sources</button>
 <button class="ghost" onclick="act('/api/test-email')">Test e-mail</button>
@@ -1742,6 +2317,16 @@ DASHBOARD_HTML = """<!DOCTYPE html><html><head><meta charset="utf-8">
 <main>
 <section style="grid-column:1/-1"><h2>Status</h2><div class="stats" id="stats">
 </div></section>
+<section style="grid-column:1/-1"><h2>Devices (last 7 days)</h2>
+<table id="devices"><tbody></tbody></table>
+<form class="inline" onsubmit="return manualOverride(this)">
+<input name="ip" placeholder="IP address" required style="max-width:10rem">
+<input name="mins" placeholder="minutes" value="60" style="max-width:6rem">
+<button name="mode" value="pause">Pause</button>
+<button name="mode" value="unfiltered">Allow unfiltered</button>
+</form></section>
+<section style="grid-column:1/-1"><h2>Trends (14 days)</h2>
+<table id="trends"><tbody></tbody></table></section>
 <section><h2>My blocked sites</h2>
 <form class="inline" onsubmit="return addItem('/api/blocklist','domain',this)">
 <input placeholder="domain, *.wildcard or /regex/" name="v" required>
@@ -1779,9 +2364,29 @@ function fillList(id,items,delBase){$(id).innerHTML=items.map(d=>
  encodeURIComponent(d)+'\\')">x</button>':'')+'</li>').join('');}
 function cls(a){return a.startsWith('blocked')?'blocked':
  a.startsWith('flagged')?'flagged':'allowed';}
+let NAMES={};
+function nm(c){return NAMES[c]?NAMES[c]+' ('+c+')':c;}
+async function setOverride(client,mode,minutes){
+ client=decodeURIComponent(client);
+ await fetch('/api/override',{method:'POST',
+  headers:{'Content-Type':'application/json'},
+  body:JSON.stringify({client:client,mode:mode,minutes:minutes})});
+ msg(mode==='pause'?'Paused':'Unfiltered time granted');refresh();}
+async function cancelOverride(client){
+ await fetch('/api/override/'+client,{method:'DELETE'});
+ msg('Override cancelled');refresh();}
+function manualOverride(form){
+ const mode=document.activeElement&&document.activeElement.value==='unfiltered'
+  ?'unfiltered':'pause';
+ setOverride(form.ip.value.trim(),mode,parseFloat(form.mins.value)||60);
+ return false;}
 async function refresh(){
  try{
   const s=await (await fetch('/api/status')).json();
+  NAMES=s.client_names||{};
+  $('ver').textContent='v'+s.version;
+  $('upd').innerHTML=s.update_available?
+   '<span class="upd">update '+esc(s.latest_version)+' available</span>':'';
   const st=s.stats,c=s.cache||{};
   $('stats').innerHTML=[
    ['Queries',st.total_queries],['Blocked',st.blocked],
@@ -1797,14 +2402,41 @@ async function refresh(){
   fillList('whitelist',await (await fetch('/api/whitelist')).json(),
    '/api/whitelist/');
   fillList('keywords',await (await fetch('/api/keywords')).json(),null);
+  const dv=await (await fetch('/api/clients')).json();
+  $('devices').tBodies[0].innerHTML=dv.map(d=>{
+   const o=d.override;
+   return '<tr><td>'+esc(nm(d.client))+'</td><td>'+esc(d.today_total)+
+    ' today</td><td class="blocked">'+esc(d.today_blocked)+' blocked</td>'+
+    '<td>'+(o?'<span class="pill">'+esc(o.mode)+' until '+
+    esc(o.until.slice(11,16))+'</span> <button class="ghost" '+
+    'onclick="cancelOverride(\\''+encodeURIComponent(d.client)+'\\')">Resume'+
+    '</button>':
+    '<button class="warn" onclick="setOverride(\\''+
+    encodeURIComponent(d.client)+'\\',\\'pause\\',60)">Pause 1h</button>'+
+    '<button onclick="setOverride(\\''+encodeURIComponent(d.client)+
+    '\\',\\'unfiltered\\',30)">Allow 30m</button>')+'</td></tr>';
+  }).join('')||'<tr><td>No devices seen yet</td></tr>';
+  const tr=await (await fetch('/api/trends?days=14')).json();
+  const byDay={};
+  tr.forEach(e=>{const d=byDay[e.day]||(byDay[e.day]={t:0,b:0});
+   d.t+=e.total;d.b+=e.blocked;});
+  const days=Object.keys(byDay).sort();
+  const max=Math.max(1,...days.map(d=>byDay[d].t));
+  $('trends').tBodies[0].innerHTML=days.map(d=>
+   '<tr><td>'+esc(d)+'</td><td style="width:45%"><div class="bar">'+
+   '<i style="width:'+(100*byDay[d].t/max)+'%"></i></div></td><td>'+
+   esc(byDay[d].t)+' queries</td><td style="width:20%"><div class="bar">'+
+   '<i class="r" style="width:'+(100*byDay[d].b/max)+'%"></i></div></td>'+
+   '<td class="blocked">'+esc(byDay[d].b)+' blocked</td></tr>').join('')||
+   '<tr><td>No data yet</td></tr>';
   const al=await (await fetch('/api/alerts?days=7')).json();
   $('alerts').tBodies[0].innerHTML=al.slice(-30).reverse().map(a=>
-   '<tr><td>'+esc(a.time.slice(0,16))+'</td><td>'+esc(a.client)+'</td><td>'+
+   '<tr><td>'+esc(a.time.slice(0,16))+'</td><td>'+esc(nm(a.client))+'</td><td>'+
    esc(a.domain)+'</td><td class="blocked">'+esc(a.reason)+' ('+esc(a.detail)+
    ')</td></tr>').join('')||'<tr><td>No alerts this week</td></tr>';
   const q=await (await fetch('/api/queries?limit=30')).json();
   $('queries').tBodies[0].innerHTML=q.reverse().map(e=>
-   '<tr><td>'+esc(e.time.slice(11,19))+'</td><td>'+esc(e.client)+'</td><td>'+
+   '<tr><td>'+esc(e.time.slice(11,19))+'</td><td>'+esc(nm(e.client))+'</td><td>'+
    esc(e.domain)+'</td><td class="'+cls(e.action)+'">'+esc(e.action)+
    '</td></tr>').join('');
   const u=await (await fetch('/api/unblock-requests')).json();
@@ -1870,7 +2502,8 @@ def get_admin_password(config: Dict, logger: logging.Logger) -> str:
 def create_api_server(resolver: FaithFilterResolver, reporter: Reporter,
                       config: Dict,
                       block_page: Optional[BlockPageServer] = None,
-                      logger: Optional[logging.Logger] = None):
+                      logger: Optional[logging.Logger] = None,
+                      updates: Optional[UpdateChecker] = None):
     logger = logger or logging.getLogger("FaithFilter")
     app = Flask(__name__)
     api_cfg = config.get("http_api", {})
@@ -1940,11 +2573,15 @@ def create_api_server(resolver: FaithFilterResolver, reporter: Reporter,
     @app.route("/api/status")
     def status():
         return jsonify({
+            "version": __version__,
+            "update_available": bool(updates and updates.update_available),
+            "latest_version": updates.latest_version if updates else None,
             "stats": resolver.stats,
             "lists": resolver.blocklists.stats(),
             "keywords": len(resolver.keywords.keywords),
             "safe_search_rules": [r["label"] for r in resolver.safe_search.rules],
             "cache": resolver.cache.stats() if resolver.cache else None,
+            "client_names": resolver.client_names,
             "uptime_seconds": int(
                 (datetime.datetime.now(datetime.timezone.utc)
                  - resolver.start_time).total_seconds()),
@@ -1955,8 +2592,61 @@ def create_api_server(resolver: FaithFilterResolver, reporter: Reporter,
 
     @app.route("/api/health")
     def health():
-        return build_health_text(resolver), 200, {
+        return build_health_text(resolver, updates), 200, {
             "Content-Type": "text/plain; charset=utf-8"}
+
+    @app.route("/api/clients")
+    def clients():
+        """Devices seen in the last 7 days with names, today's counters and
+        any active override — powers the dashboard Devices panel."""
+        overrides = {o["client"]: o for o in resolver.overrides.list()}
+        rows: Dict[str, Dict] = {}
+        if resolver.statsdb:
+            today = datetime.date.today().isoformat()
+            for entry in resolver.statsdb.trends(days=7):
+                row = rows.setdefault(entry["client"], {
+                    "client": entry["client"],
+                    "name": resolver.client_names.get(entry["client"]),
+                    "today_total": 0, "today_blocked": 0})
+                if entry["day"] == today:
+                    row["today_total"] = entry["total"]
+                    row["today_blocked"] = entry["blocked"]
+        for client in set(list(overrides) + list(resolver.client_names)):
+            rows.setdefault(client, {
+                "client": client,
+                "name": resolver.client_names.get(client),
+                "today_total": 0, "today_blocked": 0})
+        for client, row in rows.items():
+            row["override"] = overrides.get(client)
+        return jsonify(sorted(rows.values(), key=lambda r: r["client"]))
+
+    @app.route("/api/trends")
+    def trends():
+        if not resolver.statsdb:
+            return jsonify([])
+        days = min(365, max(1, int(request.args.get("days", 30))))
+        return jsonify(resolver.statsdb.trends(days))
+
+    @app.route("/api/overrides")
+    def overrides_list():
+        return jsonify(resolver.overrides.list())
+
+    @app.route("/api/override", methods=["POST"])
+    def override_set():
+        data = request.get_json(silent=True) or {}
+        client = (data.get("client") or "").strip()
+        mode = (data.get("mode") or "").strip().lower()
+        minutes = float(data.get("minutes", 60))
+        if not client or mode not in Overrides.MODES:
+            return jsonify({"error": "client and mode "
+                            f"({'/'.join(Overrides.MODES)}) required"}), 400
+        return jsonify(resolver.overrides.set(client, mode, minutes))
+
+    @app.route("/api/override/<client>", methods=["DELETE"])
+    def override_cancel(client):
+        if resolver.overrides.cancel(client):
+            return jsonify({"cancelled": client})
+        return jsonify({"error": "no override for that client"}), 404
 
     @app.route("/api/unblock-requests")
     def unblock_requests():
@@ -1976,16 +2666,9 @@ def create_api_server(resolver: FaithFilterResolver, reporter: Reporter,
     @app.route("/api/backup")
     def backup():
         """Download config + lists as a zip archive."""
-        blocking = config.get("blocking", {})
-        candidates = {
-            "config.yaml": config.get("_config_path"),
-            "blocklist.txt": blocking.get("my_blocklist"),
-            "whitelist.txt": blocking.get("whitelist"),
-            "keywords.txt": config.get("monitoring", {}).get("keywords_file"),
-        }
         buffer = io.BytesIO()
         with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as zf:
-            for arcname, path in candidates.items():
+            for arcname, path in backup_targets(config).items():
                 if path and os.path.exists(path):
                     zf.write(path, arcname)
         buffer.seek(0)
@@ -2000,22 +2683,7 @@ def create_api_server(resolver: FaithFilterResolver, reporter: Reporter,
         upload = request.files.get("backup")
         if upload is None:
             return jsonify({"error": "multipart field 'backup' required"}), 400
-        blocking = config.get("blocking", {})
-        targets = {
-            "config.yaml": config.get("_config_path"),
-            "blocklist.txt": blocking.get("my_blocklist"),
-            "whitelist.txt": blocking.get("whitelist"),
-            "keywords.txt": config.get("monitoring", {}).get("keywords_file"),
-        }
-        restored = []
-        with zipfile.ZipFile(io.BytesIO(upload.read())) as zf:
-            for arcname in zf.namelist():
-                path = targets.get(arcname)
-                if not path:
-                    continue
-                with open(path, "wb") as f:
-                    f.write(zf.read(arcname))
-                restored.append(arcname)
+        restored = apply_backup_zip(upload.read(), config)
         resolver.blocklists.reload(download=False)
         resolver.keywords.reload()
         return jsonify({"restored": restored,
@@ -2350,8 +3018,11 @@ def main() -> None:
 
     ensure_data_files(config, logger)
     resolver = FaithFilterResolver(config, logger)
-    reporter = Reporter(config, resolver.alerts, logger, resolver.notifier,
-                        health_text=lambda: build_health_text(resolver))
+    updates = UpdateChecker(config, logger)
+    reporter = Reporter(
+        config, resolver.alerts, logger, resolver.notifier,
+        health_text=lambda: build_health_text(resolver, updates),
+        names=resolver.client_names, statsdb=resolver.statsdb)
 
     if args.send_report:
         ok = reporter.send_report(force=True)
@@ -2364,6 +3035,23 @@ def main() -> None:
 
     resolver.blocklists.start_refresh_thread()
     reporter.start_scheduler()
+    updates.start()
+
+    # Daily retention sweep (old logs are sensitive; delete, don't hoard).
+    retention_stop = threading.Event()
+
+    def retention_loop() -> None:
+        purge_old_data(config, resolver.statsdb, logger)
+        while not retention_stop.wait(86400):
+            purge_old_data(config, resolver.statsdb, logger)
+
+    threading.Thread(target=retention_loop, name="retention",
+                     daemon=True).start()
+
+    sync: Optional[SyncFollower] = None
+    if config.get("sync", {}).get("enabled", False):
+        sync = SyncFollower(config, resolver, logger)
+        sync.start()
 
     block_page: Optional[BlockPageServer] = None
     if config.get("block_page", {}).get("enabled", False):
@@ -2383,7 +3071,7 @@ def main() -> None:
                          "Install Flask or disable the API.")
         else:
             app = create_api_server(resolver, reporter, config,
-                                    block_page, logger)
+                                    block_page, logger, updates)
             host = config.get("http_api", {}).get("host", "127.0.0.1")
             port = int(config.get("http_api", {}).get("port", 5000))
             run_kwargs: Dict = {"host": host, "port": port}
@@ -2411,6 +3099,12 @@ def main() -> None:
         logger.info("Shutting down FaithFilter")
         resolver.blocklists.stop()
         reporter.stop()
+        updates.stop()
+        retention_stop.set()
+        if sync:
+            sync.stop()
+        if resolver.statsdb:
+            resolver.statsdb.stop()
         if block_page:
             block_page.stop()
         if dot_server:

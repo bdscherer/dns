@@ -51,6 +51,21 @@ their DNS server and it will:
 - **DNS-over-HTTPS / DNS-over-TLS service** — an RFC 8484 `/dns-query`
   endpoint and an optional DoT listener (Android "Private DNS"), so phones
   can keep using the filter even away from home (requires a certificate).
+- **Device names** — map IPs to friendly names ("Emma's iPad") shown in
+  reports, alerts and the dashboard.
+- **Pause & bonus time** — one-click dashboard buttons to pause a device's
+  internet or grant temporary unfiltered time, with automatic expiry
+  (persisted across restarts).
+- **Privacy-aware retention** — rotated query logs, alerts and unblock
+  requests are auto-deleted after a configurable age; browsing history is
+  not hoarded forever.
+- **Trends** — per-day, per-device statistics (SQLite) with a dashboard
+  trends view and week-over-week comparisons in the report.
+- **Update awareness** — checks GitHub daily for a newer release and says
+  so on the dashboard and in the weekly report (never auto-installs).
+- **Secondary-server sync** — run a second FaithFilter (e.g. a Raspberry
+  Pi) as DNS 2; follower mode pulls the primary's lists automatically so
+  both enforce the same rules.
 
 ## Files
 
@@ -273,6 +288,11 @@ The JSON API requires either a logged-in session or an `X-API-Key` header
 | `/api/test-email` | POST | Send a test e-mail to verify SMTP settings. |
 | `/api/backup` | GET | Download config + lists as a zip. |
 | `/api/restore` | POST | Restore from a backup zip (multipart field `backup`). |
+| `/api/clients` | GET | Devices seen recently: names, today's counters, overrides. |
+| `/api/trends?days=N` | GET | Per-day, per-device statistics (default 30 days). |
+| `/api/overrides` | GET | Active pause/unfiltered overrides. |
+| `/api/override` | POST | `{"client": ip, "mode": "pause"\|"unfiltered", "minutes": N}`. |
+| `/api/override/<client>` | DELETE | Cancel a device's override ("resume"). |
 | `/dns-query` | GET/POST | DNS-over-HTTPS (RFC 8484); no auth required. |
 
 ## How a query is handled
@@ -302,10 +322,14 @@ Every query is logged to `logs/queries.log` (rotated by size).
 
 ## Per-device policies, curfews and the block page
 
-Give the kids' devices DHCP reservations on your router, then group them:
+Give the kids' devices DHCP reservations on your router, name them, then
+group them:
 
 ```yaml
 clients:
+  names:
+    "192.168.1.20": "Emma's iPad"
+    "192.168.1.10": "Dad's laptop"
   groups:
     - name: "kids"
       members: ["192.168.1.20", "192.168.1.21"]
@@ -358,6 +382,61 @@ python3 faithfilter.py --config test_config.yaml   # manual run on :5353
 dig @127.0.0.1 -p 5353 exampleadult1.com           # → NXDOMAIN
 dig @127.0.0.1 -p 5353 www.google.com              # → SafeSearch VIP
 ```
+
+## Second server on a Raspberry Pi (no single point of failure)
+
+If the FaithFilter box dies, home DNS dies with it. The fix is a cheap
+second server — a **Raspberry Pi Zero 2 W** (~$15) is plenty — handed out
+as DNS 2 by the router. Follower mode keeps its lists identical to the
+primary automatically.
+
+1. **On the primary**, set an API key in `config.yaml` and restart:
+   ```yaml
+   http_api:
+     host: "0.0.0.0"          # the Pi must be able to reach it
+     api_key: "pick-a-long-random-string"
+   ```
+2. **Flash the Pi** with Raspberry Pi OS Lite **64-bit** (Zero 2 W, Pi 3/4/5).
+   Give it a static IP / DHCP reservation (example: `192.168.1.54`).
+3. **Install FaithFilter on the Pi** — either download the
+   `faithfilter-linux-arm64` build:
+   ```sh
+   sudo mkdir -p /opt/faithfilter && cd /opt/faithfilter
+   # copy the 'faithfilter' binary here, then:
+   sudo chmod +x faithfilter
+   ```
+   or, on a 32-bit original Pi Zero/Pi 1 (ARMv6 — no prebuilt binary), run
+   from source instead:
+   ```sh
+   sudo apt install -y python3-pip git
+   git clone https://github.com/bdscherer/dns.git /opt/faithfilter
+   pip3 install -r /opt/faithfilter/requirements.txt
+   ```
+4. **Configure the Pi as a follower** — `/opt/faithfilter/config.yaml`:
+   ```yaml
+   sync:
+     enabled: true
+     primary_url: "http://192.168.1.53:5000"   # the primary's dashboard
+     api_key: "pick-a-long-random-string"      # same value as step 1
+     interval_minutes: 60
+   email:
+     enabled: false        # only the primary sends reports/alerts
+   ```
+   Blocklist *sources* download independently on the Pi; the sync pulls
+   your personal blocklist, whitelist and keywords so edits on the
+   primary's dashboard reach the Pi within the hour. Client groups and
+   curfews live in `config.yaml` — copy that section over once, or set
+   `include_config: true` to mirror the whole config (the follower
+   automatically re-applies its own `sync:` section after each pull so
+   the mirroring can't disable itself).
+5. **Free port 53 and install the service** (same as the primary):
+   ```sh
+   sudo ./faithfilter --install-service      # or via python3 faithfilter.py
+   ```
+6. **On the router**, set **DNS 1** = primary IP, **DNS 2** = Pi IP.
+   Devices will use the Pi automatically whenever the primary is down —
+   and it enforces the same rules, so an outage never becomes an
+   unfiltered window.
 
 ## Installing as a service in one command
 

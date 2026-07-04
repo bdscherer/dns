@@ -101,6 +101,15 @@ blocking:
 # Per-device policies: groups, filtering levels and curfews
 # -----------------------------------------------------------------------------
 clients:
+  # Friendly device names, shown in reports, alerts and the dashboard.
+  names: {}
+  #  "192.168.1.20": "Emma's iPad"
+  #  "192.168.1.21": "Family PC"
+
+  # Temporary pause/unfiltered overrides (dashboard "Pause"/"Allow" buttons)
+  # are persisted here so they survive restarts.
+  overrides_file: "logs/overrides.json"
+
   # Devices are matched by IP or CIDR range (give them DHCP reservations on
   # your router first). Clients in no group get full filtering with safe
   # search and no curfew. Group settings:
@@ -172,6 +181,9 @@ monitoring:
   # Where alerts are stored for the weekly report.
   alert_log_file: "logs/alerts.jsonl"
 
+  # Alerts and unblock requests older than this are deleted daily.
+  alert_retention_days: 90
+
 # -----------------------------------------------------------------------------
 # Safe search / restricted mode enforcement
 # -----------------------------------------------------------------------------
@@ -207,9 +219,12 @@ email:
   to:
     - "bdscherer@gmail.com"
 
-  # When to send: every <report_day> at <report_hour>:00 UTC.
+  # When to send: every <report_day> at <report_hour>:00.
   report_day: "sunday"
   report_hour: 8
+  # "local" (default) uses the server's clock, matching curfews;
+  # "utc" keeps the pre-2.1 behaviour.
+  report_timezone: "local"
 
   # Send a "no alerts" e-mail on quiet weeks so you know it is working.
   send_if_empty: true
@@ -220,11 +235,41 @@ email:
 # -----------------------------------------------------------------------------
 # Logging and API
 # -----------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# Long-term statistics, update checks, and secondary-server sync
+# -----------------------------------------------------------------------------
+stats:
+  # Per-day, per-device counters (SQLite) powering the dashboard trends
+  # view and the week-over-week lines in the report.
+  enabled: true
+  db_file: "logs/stats.db"
+  retention_days: 365
+
+updates:
+  # Check GitHub daily for a newer tagged release. Shown on the dashboard
+  # and in the weekly report; nothing is ever installed automatically.
+  check: true
+  repo: "bdscherer/dns"
+
+sync:
+  # FOLLOWER MODE for a secondary server (e.g. a Raspberry Pi running as
+  # your router's DNS 2). Pulls blocklist/whitelist/keywords from the
+  # primary's /api/backup on an interval so both servers enforce the same
+  # rules. Set http_api.api_key on the PRIMARY and copy it here.
+  enabled: false
+  primary_url: ""            # e.g. "http://192.168.1.53:5000"
+  api_key: ""
+  interval_minutes: 60
+  include_config: false      # also pull config.yaml (requires restart)
+
 logs:
   query_log_file: "logs/queries.log"
   log_level: "INFO"
   max_log_mb: 20       # rotate query/alert logs beyond this size
   log_backups: 3       # rotated copies to keep (.1, .2, ...)
+  # Rotated query logs older than this are deleted daily - browsing
+  # history is sensitive, so it is not kept forever.
+  retention_days: 30
 
 # -----------------------------------------------------------------------------
 # Dashboard, API and DNS-over-HTTPS

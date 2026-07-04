@@ -14,6 +14,7 @@ import os
 import shutil
 import socket
 import tempfile
+import time
 import unittest
 
 from dnslib import A, DNSRecord, QTYPE, RCODE, RR
@@ -22,8 +23,10 @@ from dnslib.server import BaseResolver, DNSLogger, DNSServer
 import faithfilter
 from faithfilter import (
     DEFAULT_CONFIG, AlertLog, BlocklistManager, ClientPolicies, DNSCache,
-    FaithFilterResolver, KeywordMonitor, Notifier, Reporter, build_report,
-    create_api_server, deep_merge, parse_domain_lines, rotate_if_needed,
+    FaithFilterResolver, KeywordMonitor, Notifier, Overrides, Reporter,
+    StatsDB, UpdateChecker, apply_backup_zip, build_report,
+    create_api_server, deep_merge, parse_domain_lines, purge_old_data,
+    rotate_if_needed,
 )
 
 UPSTREAM_PORT = 15353
@@ -151,7 +154,7 @@ class ReportTests(unittest.TestCase):
     def test_empty_report(self):
         now = datetime.datetime.now(datetime.timezone.utc)
         text = build_report([], now - datetime.timedelta(days=7), now)
-        self.assertIn("No adult-content or keyword alerts", text)
+        self.assertIn("No adult-content, bypass or keyword alerts", text)
 
     def test_report_aggregation(self):
         now = datetime.datetime.now(datetime.timezone.utc)
@@ -167,7 +170,8 @@ class ReportTests(unittest.TestCase):
              "detail": "casino"},
         ]
         text = build_report(alerts, now - datetime.timedelta(days=7), now)
-        self.assertIn("Total alerts: 3 (2 adult-domain, 1 keyword)", text)
+        self.assertIn("Total alerts: 3 (2 adult-domain, 0 bypass-attempt, "
+                      "1 keyword)", text)
         self.assertIn("192.168.1.10", text)
         self.assertIn("bad-adult-site.example", text)
         self.assertIn("casino", text)
@@ -285,6 +289,132 @@ class UnitTests(unittest.TestCase):
             self.assertIn("Filter health:", body)
         finally:
             shutil.rmtree(tmp)
+
+
+class FeatureTests(unittest.TestCase):
+    """Overrides, stats, retention, update check, backup apply, names."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp)
+
+    def path(self, name):
+        return os.path.join(self.tmp, name)
+
+    def test_overrides_set_expire_cancel(self):
+        ov = Overrides(self.path("ov.json"), LOGGER)
+        ov.set("10.0.0.5", "pause", 60)
+        self.assertEqual(ov.active("10.0.0.5"), "pause")
+        self.assertIsNone(ov.active("10.0.0.6"))
+        # Persistence across "restart"
+        ov2 = Overrides(self.path("ov.json"), LOGGER)
+        self.assertEqual(ov2.active("10.0.0.5"), "pause")
+        self.assertTrue(ov2.cancel("10.0.0.5"))
+        self.assertIsNone(ov2.active("10.0.0.5"))
+        # Expiry
+        ov2.set("10.0.0.7", "unfiltered", -1)
+        self.assertIsNone(ov2.active("10.0.0.7"))
+        with self.assertRaises(ValueError):
+            ov2.set("10.0.0.8", "bogus", 10)
+
+    def test_statsdb_record_trends_and_totals(self):
+        db = StatsDB(self.path("stats.db"), LOGGER, flush_interval=0)
+        db.record("10.0.0.5", "allowed")
+        db.record("10.0.0.5", "blocked:ads")
+        db.record("10.0.0.6", "flagged:keyword:x")
+        rows = db.trends(days=1)
+        by_client = {r["client"]: r for r in rows}
+        self.assertEqual(by_client["10.0.0.5"]["total"], 2)
+        self.assertEqual(by_client["10.0.0.5"]["blocked"], 1)
+        self.assertEqual(by_client["10.0.0.6"]["flagged"], 1)
+        today = datetime.date.today()
+        totals = db.totals_between(today, today + datetime.timedelta(days=1))
+        self.assertEqual(totals["total"], 3)
+        db.stop()
+
+    def test_retention_purges_old_alerts_and_logs(self):
+        alerts_file = self.path("alerts.jsonl")
+        old = (datetime.datetime.now(datetime.timezone.utc)
+               - datetime.timedelta(days=200)).isoformat()
+        new = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        with open(alerts_file, "w") as f:
+            f.write(json.dumps({"time": old, "client": "x", "domain": "d",
+                                "reason": "keyword", "detail": "k"}) + "\n")
+            f.write(json.dumps({"time": new, "client": "x", "domain": "d",
+                                "reason": "keyword", "detail": "k"}) + "\n")
+        rotated = self.path("queries.log.1")
+        with open(rotated, "w") as f:
+            f.write("old\n")
+        os.utime(rotated, (time.time() - 90 * 86400,) * 2)
+        config = {"logs": {"query_log_file": self.path("queries.log"),
+                           "retention_days": 30},
+                  "monitoring": {"alert_log_file": alerts_file,
+                                 "alert_retention_days": 90}}
+        purge_old_data(config, None, LOGGER)
+        self.assertFalse(os.path.exists(rotated))
+        with open(alerts_file) as f:
+            lines = f.readlines()
+        self.assertEqual(len(lines), 1)
+        self.assertIn(new, lines[0])
+
+    def test_update_version_comparison(self):
+        self.assertGreater(UpdateChecker._as_tuple("v2.2.0"),
+                           UpdateChecker._as_tuple("2.1.0"))
+        self.assertGreater(UpdateChecker._as_tuple("2.10.0"),
+                           UpdateChecker._as_tuple("2.9.9"))
+        self.assertEqual(UpdateChecker._as_tuple("v1.0"),
+                         UpdateChecker._as_tuple("1.0"))
+
+    def test_apply_backup_zip_writes_lists_only_by_default(self):
+        import io as io_mod
+        import zipfile as zf_mod
+        buffer = io_mod.BytesIO()
+        with zf_mod.ZipFile(buffer, "w") as zf:
+            zf.writestr("blocklist.txt", "synced.example\n")
+            zf.writestr("config.yaml", "dns: {}\n")
+            zf.writestr("evil.sh", "#!/bin/sh\n")   # must be ignored
+        config = {"blocking": {"my_blocklist": self.path("bl.txt"),
+                               "whitelist": self.path("wl.txt")},
+                  "monitoring": {"keywords_file": self.path("kw.txt")},
+                  "_config_path": self.path("config.yaml")}
+        restored = apply_backup_zip(buffer.getvalue(), config,
+                                    include_config=False)
+        self.assertEqual(restored, ["blocklist.txt"])
+        self.assertFalse(os.path.exists(self.path("config.yaml")))
+        self.assertFalse(os.path.exists(self.path("evil.sh")))
+        with open(self.path("bl.txt")) as f:
+            self.assertIn("synced.example", f.read())
+
+    def test_sync_preserves_follower_sync_section(self):
+        from faithfilter import SyncFollower
+        import yaml as yaml_mod
+        config_path = self.path("config.yaml")
+        config = {"sync": {"enabled": True,
+                           "primary_url": "http://primary:5000",
+                           "api_key": "k", "interval_minutes": 60},
+                  "_config_path": config_path}
+        follower = SyncFollower(config, None, LOGGER)
+        # Simulate a pulled primary config that has sync disabled.
+        with open(config_path, "w") as f:
+            yaml_mod.safe_dump({"sync": {"enabled": False},
+                                "dns": {"listen_port": 53}}, f)
+        follower._preserve_sync_section()
+        with open(config_path) as f:
+            result = yaml_mod.safe_load(f)
+        self.assertTrue(result["sync"]["enabled"])
+        self.assertEqual(result["sync"]["primary_url"], "http://primary:5000")
+        self.assertEqual(result["dns"]["listen_port"], 53)
+
+    def test_report_uses_device_names(self):
+        now = datetime.datetime.now(datetime.timezone.utc)
+        alerts = [{"time": now.isoformat(), "client": "192.168.1.20",
+                   "domain": "bad.example", "reason": "adult_domain",
+                   "detail": "adult"}]
+        text = build_report(alerts, now - datetime.timedelta(days=7), now,
+                            names={"192.168.1.20": "Emma's iPad"})
+        self.assertIn("Emma's iPad (192.168.1.20)", text)
 
 
 class EndToEndTests(unittest.TestCase):
@@ -476,6 +606,28 @@ class EndToEndTests(unittest.TestCase):
         query("cache-me.example")
         self.assertGreater(self.resolver.cache.stats()["hits"], before)
 
+    def test_pause_override_blocks_everything(self):
+        self.resolver.overrides.set("127.0.0.1", "pause", 60)
+        try:
+            reply = query("paused-while-testing.example")
+            self.assertEqual(reply.header.rcode, RCODE.NXDOMAIN)
+        finally:
+            self.resolver.overrides.cancel("127.0.0.1")
+        reply = query("resumed-after-testing.example")
+        self.assertEqual(reply.header.rcode, RCODE.NOERROR)
+        self.assertEqual(answer_ips(reply), [UPSTREAM_IP])
+
+    def test_unfiltered_override_skips_blocklist(self):
+        self.resolver.overrides.set("127.0.0.1", "unfiltered", 60)
+        try:
+            reply = query("mybadsite.com")
+            self.assertEqual(reply.header.rcode, RCODE.NOERROR)
+            self.assertEqual(answer_ips(reply), [UPSTREAM_IP])
+        finally:
+            self.resolver.overrides.cancel("127.0.0.1")
+        reply = query("mybadsite.com")
+        self.assertEqual(reply.header.rcode, RCODE.NXDOMAIN)
+
 
 class ApiTests(unittest.TestCase):
     """Dashboard auth, DoH endpoint and backup, via the Flask test client."""
@@ -551,6 +703,30 @@ class ApiTests(unittest.TestCase):
             names = set(zf.namelist())
         self.assertIn("blocklist.txt", names)
         self.assertIn("config.yaml", names)
+
+    def test_override_endpoints(self):
+        self.login()
+        response = self.client.post("/api/override", json={
+            "client": "192.168.1.44", "mode": "pause", "minutes": 5})
+        self.assertEqual(response.status_code, 200)
+        listed = self.client.get("/api/overrides").get_json()
+        self.assertTrue(any(o["client"] == "192.168.1.44" for o in listed))
+        response = self.client.delete("/api/override/192.168.1.44")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(self.client.get("/api/overrides").get_json(), [])
+        response = self.client.post("/api/override", json={
+            "client": "x", "mode": "bogus"})
+        self.assertEqual(response.status_code, 400)
+
+    def test_clients_and_trends_endpoints(self):
+        self.login()
+        self.assertEqual(self.client.get("/api/trends").status_code, 200)
+        self.assertEqual(self.client.get("/api/clients").status_code, 200)
+
+    def test_status_reports_version(self):
+        self.login()
+        status = self.client.get("/api/status").get_json()
+        self.assertEqual(status["version"], faithfilter.__version__)
 
 
 if __name__ == "__main__":
