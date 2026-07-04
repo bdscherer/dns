@@ -93,8 +93,9 @@ sudo python3 faithfilter.py --config config.yaml
 ## Standalone executable (no Python required)
 
 Every push to `main` builds self-contained executables via GitHub Actions
-(`.github/workflows/build.yml`): `faithfilter.exe` for Windows,
-`faithfilter` for Linux x64 and Linux ARM64 (Raspberry Pi 64-bit OS).
+(`.github/workflows/build.yml`): `faithfilter.exe` **plus the windowed
+`faithfilter-gui.exe` Control Panel** for Windows, and `faithfilter` for
+Linux x64 and Linux ARM64 (Raspberry Pi 64-bit OS).
 Download them from the repository's **Actions** tab (workflow artifacts) or,
 for tagged releases (`git tag v1.0 && git push --tags`), from the
 **Releases** page. Each artifact contains the executable plus template
@@ -133,10 +134,33 @@ pyinstaller --onefile --name faithfilter faithfilter.py
 # result: dist/faithfilter (or dist\faithfilter.exe on Windows)
 ```
 
-### Running the EXE on Windows
+### Windows: the Control Panel (recommended)
 
-1. Extract the zip to `C:\FaithFilter` and (optionally) run
-   `faithfilter.exe --setup` in a terminal to configure e-mail reports.
+The Windows download includes **`faithfilter-gui.exe`** — a normal windowed
+app (no console/"DOS" window) that configures and runs everything for you.
+`faithfilter.exe` next to it is the background service the GUI launches;
+you don't need to touch it directly.
+
+1. Extract the zip to `C:\FaithFilter`.
+2. **Right-click `faithfilter-gui.exe` → Run as administrator** (port 53
+   needs admin; if you forget, the panel offers to relaunch elevated).
+3. Fill in the tabs — Network, Blocking, Monitoring, Safe Search, Email,
+   Alerts, Devices, Advanced — then click **Start service**. Settings are
+   saved to `config.yaml`; **Open dashboard** shows live activity, and the
+   **Status & Log** tab streams what the service is doing.
+
+The GUI covers every configuration option. To have it start with Windows,
+either tick nothing and leave the window open, or install the service to
+run at boot with `faithfilter.exe --install-service` (the GUI can still
+attach to view status).
+
+On Linux/macOS the same panel runs with `python3 faithfilter_gui.py`
+(needs Tk: `sudo apt install python3-tk`).
+
+### Running the service directly (headless / Linux)
+
+1. Extract the zip and (optionally) run `faithfilter.exe --setup` in a
+   terminal to configure e-mail reports.
 2. Port 53 must be free: if the **Internet Connection Sharing (ICS)**
    service is running, stop and disable it (`services.msc`).
 3. Allow DNS through the firewall (admin prompt):
