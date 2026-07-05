@@ -66,6 +66,12 @@ their DNS server and it will:
 - **Secondary-server sync** — run a second FaithFilter (e.g. a Raspberry
   Pi) as DNS 2; follower mode pulls the primary's lists automatically so
   both enforce the same rules.
+- **Accountability partners** — assign each person their devices and one or
+  more *allies*; each ally gets that person's weekly report (category
+  breakdown, time-of-day pattern, clean streak, evasion attempts, search
+  terms, tamper log) plus instant alerts — network-layer accountability
+  with no device slowdown. An optional browser extension adds search-term
+  visibility.
 
 ## Files
 
@@ -93,8 +99,9 @@ sudo python3 faithfilter.py --config config.yaml
 ## Standalone executable (no Python required)
 
 Every push to `main` builds self-contained executables via GitHub Actions
-(`.github/workflows/build.yml`): `faithfilter.exe` for Windows,
-`faithfilter` for Linux x64 and Linux ARM64 (Raspberry Pi 64-bit OS).
+(`.github/workflows/build.yml`): `faithfilter.exe` **plus the windowed
+`faithfilter-gui.exe` Control Panel** for Windows, and `faithfilter` for
+Linux x64 and Linux ARM64 (Raspberry Pi 64-bit OS).
 Download them from the repository's **Actions** tab (workflow artifacts) or,
 for tagged releases (`git tag v1.0 && git push --tags`), from the
 **Releases** page. Each artifact contains the executable plus template
@@ -133,10 +140,33 @@ pyinstaller --onefile --name faithfilter faithfilter.py
 # result: dist/faithfilter (or dist\faithfilter.exe on Windows)
 ```
 
-### Running the EXE on Windows
+### Windows: the Control Panel (recommended)
 
-1. Extract the zip to `C:\FaithFilter` and (optionally) run
-   `faithfilter.exe --setup` in a terminal to configure e-mail reports.
+The Windows download includes **`faithfilter-gui.exe`** — a normal windowed
+app (no console/"DOS" window) that configures and runs everything for you.
+`faithfilter.exe` next to it is the background service the GUI launches;
+you don't need to touch it directly.
+
+1. Extract the zip to `C:\FaithFilter`.
+2. **Right-click `faithfilter-gui.exe` → Run as administrator** (port 53
+   needs admin; if you forget, the panel offers to relaunch elevated).
+3. Fill in the tabs — Network, Blocking, Monitoring, Safe Search, Email,
+   Alerts, Devices, Advanced — then click **Start service**. Settings are
+   saved to `config.yaml`; **Open dashboard** shows live activity, and the
+   **Status & Log** tab streams what the service is doing.
+
+The GUI covers every configuration option. To have it start with Windows,
+either tick nothing and leave the window open, or install the service to
+run at boot with `faithfilter.exe --install-service` (the GUI can still
+attach to view status).
+
+On Linux/macOS the same panel runs with `python3 faithfilter_gui.py`
+(needs Tk: `sudo apt install python3-tk`).
+
+### Running the service directly (headless / Linux)
+
+1. Extract the zip and (optionally) run `faithfilter.exe --setup` in a
+   terminal to configure e-mail reports.
 2. Port 53 must be free: if the **Internet Connection Sharing (ICS)**
    service is running, stop and disable it (`services.msc`).
 3. Allow DNS through the firewall (admin prompt):
@@ -293,6 +323,11 @@ The JSON API requires either a logged-in session or an `X-API-Key` header
 | `/api/overrides` | GET | Active pause/unfiltered overrides. |
 | `/api/override` | POST | `{"client": ip, "mode": "pause"\|"unfiltered", "minutes": N}`. |
 | `/api/override/<client>` | DELETE | Cancel a device's override ("resume"). |
+| `/api/people` | GET | Accountability people with clean-streak days. |
+| `/api/audit?days=N` | GET | Filter-change / tamper log. |
+| `/api/searches?days=N` | GET | Search terms & visits from the extension. |
+| `/api/accountability/preview` | GET | Plain-text preview of the ally reports. |
+| `/api/extension/events` | POST | Extension reporting endpoint (extension-key auth). |
 | `/dns-query` | GET/POST | DNS-over-HTTPS (RFC 8484); no auth required. |
 
 ## How a query is handled
@@ -437,6 +472,59 @@ primary automatically.
    Devices will use the Pi automatically whenever the primary is down —
    and it enforces the same rules, so an outage never becomes an
    unfiltered window.
+
+## Accountability (rivaling Covenant Eyes, without the slowdown)
+
+On-device accountability tools tunnel all traffic through a VPN and take
+screenshots analysed on the device — that's what drains battery and adds
+lag. FaithFilter does the work at the network layer, so devices do nothing
+extra (and browsing is actually faster thanks to the DNS cache). The honest
+trade-off: it sees *where* devices go and *what they search*, not the pixels
+on the screen — roughly 90% of the accountability signal at 0% of the
+performance cost.
+
+Assign people, devices and allies:
+
+```yaml
+accountability:
+  enabled: true
+  people:
+    - name: "Sam"
+      devices: ["192.168.1.30", "192.168.1.31"]
+      allies: ["mentor@example.com", "spouse@example.com"]
+```
+
+Each ally then receives Sam's report directly, with:
+
+- **Category breakdown** (adult, gambling, dating, social, streaming, …)
+- **Time-of-day pattern** (late-night activity is itself a signal)
+- **Clean streak** — consecutive days with no flagged activity
+- **Evasion attempts** — VPN/proxy/DoH requests, and **dark-device**
+  detection when a device stops appearing (bypassing or switched off)
+- **Tamper log** — every pause, unfiltered-time grant and whitelist change
+- **Search terms** — when the optional browser extension is installed
+
+Allies also get **instant e-mail alerts** (throttled) the moment a device
+hits adult content or a bypass service. Preview everything at
+`GET /api/accountability/preview`.
+
+### Search-term visibility: the browser extension
+
+DNS can't see search terms or in-page activity. The optional extension in
+[`extension/`](extension/) closes most of that gap **without any device
+slowdown** — no VPN, no screenshots, no on-device analysis; it just reads
+the destination hostname and the search query from the URL and batches them
+to the server once a minute. Enable it server-side:
+
+```yaml
+extension:
+  enabled: true
+  key: "pick-a-long-random-string"
+```
+
+then load `extension/` as an unpacked extension and point it at your server
+(see [`extension/README.md`](extension/README.md)). For accountability that
+can't simply be switched off, install it on a managed browser profile.
 
 ## Installing as a service in one command
 

@@ -16,6 +16,7 @@ jobs:
           python-version: "3.11"
       - run: pip install -r requirements.txt
       - run: python test_faithfilter.py
+      - run: python test_gui.py
 
   build:
     needs: test
@@ -42,16 +43,24 @@ jobs:
         with:
           python-version: "3.11"
       - run: pip install -r requirements.txt pyinstaller
-      - name: Build standalone executable
+      - name: Build the service executable
         run: pyinstaller --onefile --name faithfilter faithfilter.py
+      - name: Build the Windows GUI (windowed, no console)
+        if: matrix.os == 'windows-latest'
+        run: pyinstaller --onefile --windowed --name faithfilter-gui faithfilter_gui.py
       - name: Assemble distribution folder
         shell: bash
         run: |
           mkdir -p pkg
           cp "dist/${{ matrix.binary }}" pkg/
           cp README.md pkg/
-          # Nothing else is needed: all configuration is built into the
-          # executable, which creates its data files on first run.
+          # On Windows, ship the GUI Control Panel alongside the service so
+          # users get a real window instead of a console. The GUI launches
+          # faithfilter.exe (found next to it) hidden.
+          if [ "${{ matrix.os }}" = "windows-latest" ]; then
+            cp dist/faithfilter-gui.exe pkg/
+          fi
+          # All configuration is built in; data files are created on first run.
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact }}
