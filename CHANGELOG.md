@@ -3,6 +3,30 @@
 All notable changes to FaithFilter are documented here. The project follows
 [semantic versioning](https://semver.org/).
 
+## [2.3.0]
+
+Per-device protection so the filter follows a person onto cellular.
+
+### Added
+- **Per-person device endpoints**: each person gets a stable token and a
+  personal DoH endpoint `https://<base_domain>/p/<token>/dns-query`. Queries
+  through it are attributed to that person's accountability report even when
+  the device is off the home network (e.g. a phone on cellular).
+- **Device profile generator** for Apple (`.mobileconfig`), Android (Private
+  DNS card), Windows (DoH PowerShell) and Linux (systemd-resolved DoT), with
+  a dashboard "Set up a device" panel and `/api/devices` endpoints.
+- **Production client installers** under `clients/`:
+  `windows/setup-faithfilter.ps1`, `linux/setup-faithfilter.sh`, and an
+  Android Private DNS guide, each with lock-down guidance.
+- DoT **SNI-based attribution**: a per-person subdomain
+  (`<token>.<base_domain>`) maps the Android Private DNS connection to the
+  right person.
+- `accountability.base_domain` config and a stable `device_tokens_file`.
+
+### Fixed
+- The SERVFAIL fallback used an unsupported `reply(rcode=...)` call and would
+  raise if every upstream failed; it now returns SERVFAIL correctly.
+
 ## [2.2.0]
 
 First public release under the AGPL-3.0 license.

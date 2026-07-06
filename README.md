@@ -108,6 +108,12 @@ their DNS server and it will:
   terms, tamper log) plus instant alerts — network-layer accountability
   with no device slowdown. An optional browser extension adds search-term
   visibility.
+- **Per-device protection that follows onto cellular** — each person gets a
+  personal encrypted-DNS endpoint; the dashboard's *Set up a device*
+  generates ready-to-install profiles for **Apple, Android, Windows and
+  Linux** (see [`clients/`](clients/) and [`docs/PER_DEVICE.md`](docs/PER_DEVICE.md)),
+  so a phone stays filtered and attributed to the right person even off the
+  home Wi-Fi.
 
 ## Files
 

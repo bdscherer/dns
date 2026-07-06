@@ -56,17 +56,23 @@ forwarding for 443/853, and a Let's Encrypt certificate.
 > **hosted service** is for — same device profiles, but pointed at a managed
 > endpoint instead of your house.
 
-### The easy button we can build: a profile generator
+### The easy button — the profile generator (shipped in 2.3.0)
 
-The friction above is "create a correct DNS profile." That's automatable.
-**Planned feature:** a dashboard page that generates, for a chosen person:
+The friction above is "create a correct DNS profile." That's now automated.
+Set `accountability.base_domain` in `config.yaml`, then open the dashboard's
+Accountability section → **Set up a device**. For each person you get
+one-click downloads, pre-filled with that family's endpoint and the person's
+token:
 
-- an **Android** Private DNS hostname to paste in, and
-- a downloadable **Apple `.mobileconfig`** and **Windows** setup,
+- **Apple** `.mobileconfig` (iOS/macOS, DoH)
+- **Android** Private DNS hostname card
+- **Windows** DoH PowerShell script
+- **Linux** systemd-resolved DoT script
 
-each pre-filled with that family's DoH/DoT endpoint and the person's token,
-so setup is "open this link on the phone, tap install." This turns Layer 1
-from a sysadmin task into a two-minute step. (Tracked in the roadmap below.)
+The same scripts live in [`../clients/`](../clients/) for command-line
+setup. Each person has a stable token and a personal endpoint
+`https://<base_domain>/p/<token>/dns-query`, so their activity is attributed
+to the right accountability report **even on cellular**.
 
 ---
 

@@ -24,10 +24,11 @@ from dnslib.server import BaseResolver, DNSLogger, DNSServer
 import faithfilter
 from faithfilter import (
     DEFAULT_CONFIG, Accountability, AlertLog, AuditLog, BlocklistManager,
-    ClientPolicies, DNSCache, FaithFilterResolver, KeywordMonitor, Notifier,
-    Overrides, Person, Reporter, SearchLog, StatsDB, UpdateChecker,
-    apply_backup_zip, build_accountability_report, build_report,
-    classify_domain, create_api_server, deep_merge, parse_domain_lines,
+    ClientPolicies, DNSCache, DeviceTokens, FaithFilterResolver,
+    KeywordMonitor, Notifier, Overrides, Person, Reporter, SearchLog,
+    StatsDB, UpdateChecker, apply_backup_zip, build_accountability_report,
+    build_device_profile, build_report, classify_domain, create_api_server,
+    deep_merge, device_endpoints, parse_domain_lines,
     purge_old_data, rotate_if_needed,
 )
 
@@ -515,6 +516,48 @@ class AccountabilityTests(unittest.TestCase):
         self.assertIn("override_pause", text)
 
 
+class DeviceProfileTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp)
+
+    def test_device_tokens_stable_and_persisted(self):
+        path = os.path.join(self.tmp, "tok.json")
+        dt = DeviceTokens(path, LOGGER)
+        t1 = dt.token_for("Sam")
+        self.assertEqual(dt.token_for("Sam"), t1)      # stable
+        self.assertNotEqual(dt.token_for("Alex"), t1)  # distinct
+        # persisted across "restart"
+        dt2 = DeviceTokens(path, LOGGER)
+        self.assertEqual(dt2.token_for("Sam"), t1)
+        self.assertEqual(dt2.person_for_token(t1), "Sam")
+        self.assertIsNone(dt2.person_for_token("nope"))
+
+    def test_endpoints_and_profiles(self):
+        eps = device_endpoints("dns.example.com", "TKN")
+        self.assertEqual(eps["doh_url"],
+                         "https://dns.example.com/p/TKN/dns-query")
+        self.assertEqual(eps["dot_person"], "TKN.dns.example.com")
+        apple = build_device_profile("apple", "Sam", "TKN", "dns.example.com")
+        self.assertTrue(apple[0].endswith(".mobileconfig"))
+        self.assertIn("com.apple.dnsSettings.managed", apple[2])
+        self.assertIn("https://dns.example.com/p/TKN/dns-query", apple[2])
+        win = build_device_profile("windows", "Sam", "TKN", "dns.example.com")
+        self.assertIn("dohtemplate", win[2])
+        lin = build_device_profile("linux", "Sam", "TKN", "dns.example.com")
+        self.assertIn("DNSOverTLS=yes", lin[2])
+        andr = build_device_profile("android", "Sam", "TKN", "dns.example.com")
+        self.assertIn("TKN.dns.example.com", andr[2])
+        self.assertIsNone(build_device_profile("bogus", "Sam", "T", "d"))
+
+    def test_apple_profile_escapes_person_name(self):
+        prof = build_device_profile("apple", "<b>x</b>", "TKN", "d")
+        self.assertNotIn("<b>x</b>", prof[2])
+        self.assertIn("&lt;b&gt;", prof[2])
+
+
 class SecurityTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp()
@@ -815,11 +858,13 @@ class ApiTests(unittest.TestCase):
                          "cache_dir": path("cache"), "sources": []},
             "monitoring": {"alert_log_file": path("alerts.jsonl")},
             "clients": {"overrides_file": path("overrides.json")},
-            "accountability": {"enabled": True, "people": [
+            "accountability": {"enabled": True, "base_domain": "dns.example.com",
+                "people": [
                 {"name": "Sam", "devices": ["127.0.0.1"],
                  "allies": ["ally@example.com"]}],
                 "audit_log_file": path("audit.jsonl"),
-                "search_log_file": path("searches.jsonl")},
+                "search_log_file": path("searches.jsonl"),
+                "device_tokens_file": path("tokens.json")},
             "extension": {"enabled": True, "key": "ext-key"},
             "stats": {"db_file": path("stats.db")},
             "logs": {"query_log_file": None},
@@ -922,6 +967,39 @@ class ApiTests(unittest.TestCase):
         preview = self.client.get("/api/accountability/preview")
         self.assertEqual(preview.status_code, 200)
         self.assertIn(b"Sam", preview.data)
+
+    def test_devices_list_and_profile_download(self):
+        self.login()
+        devices = self.client.get("/api/devices").get_json()
+        self.assertEqual(devices["base_domain"], "dns.example.com")
+        sam = next(p for p in devices["people"] if p["name"] == "Sam")
+        self.assertIn("/p/", sam["doh_url"])
+        # download each platform profile
+        for platform in ("apple", "android", "windows", "linux"):
+            resp = self.client.get(f"/api/devices/Sam/{platform}")
+            self.assertEqual(resp.status_code, 200, platform)
+            self.assertIn("attachment", resp.headers.get("Content-Disposition", ""))
+        self.assertEqual(self.client.get("/api/devices/Nobody/apple").status_code, 404)
+
+    def test_token_doh_endpoint_filters_without_login(self):
+        import base64
+        # find Sam's token from the resolver behind the app
+        devices = self.app.test_client()
+        # use the API (needs login) to get the endpoint, then hit it anonymously
+        self.login()
+        sam = next(p for p in self.client.get("/api/devices").get_json()["people"]
+                   if p["name"] == "Sam")
+        token = sam["doh_url"].split("/p/")[1].split("/")[0]
+        wire = faithfilter.DNSRecord.question("mybadsite.com", "A").pack()
+        enc = base64.urlsafe_b64encode(bytes(wire)).decode().rstrip("=")
+        # fresh unauthenticated client
+        anon = self.app.test_client()
+        good = anon.get(f"/p/{token}/dns-query?dns={enc}")
+        self.assertEqual(good.status_code, 200)
+        reply = faithfilter.DNSRecord.parse(good.data)
+        self.assertEqual(reply.header.rcode, RCODE.NXDOMAIN)
+        # unknown token -> 404
+        self.assertEqual(anon.get(f"/p/bogus/dns-query?dns={enc}").status_code, 404)
 
     def test_audit_recorded_on_override(self):
         self.login()
