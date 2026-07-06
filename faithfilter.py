@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: AGPL-3.0-or-later
 """
 FaithFilter DNS filtering service
 ---------------------------------
@@ -35,6 +36,7 @@ import copy
 import datetime
 import fnmatch
 import getpass
+import html as html_lib
 import hashlib
 import io
 import ipaddress
@@ -52,6 +54,7 @@ import sys
 import threading
 import time
 import urllib.request
+import uuid
 import zipfile
 from collections import OrderedDict
 from email.message import EmailMessage
@@ -63,7 +66,7 @@ import yaml
 from dnslib import A, AAAA, DNSRecord, QTYPE, RCODE, RR
 from dnslib.server import BaseResolver, DNSLogger, DNSServer
 
-__version__ = "2.2.0"
+__version__ = "2.3.0"
 
 try:
     # Flask is optional; the service still runs in DNS-only mode when the
@@ -687,7 +690,8 @@ class AlertLog:
         self._lock = threading.Lock()
         self._recent: Dict[Tuple[str, str, str], float] = {}
 
-    def add(self, client: str, domain: str, reason: str, detail: str) -> None:
+    def add(self, client: str, domain: str, reason: str, detail: str,
+            person: str = "") -> None:
         key = (client, domain, reason)
         now = time.time()
         with self._lock:
@@ -702,8 +706,9 @@ class AlertLog:
             "time": datetime.datetime.now(datetime.timezone.utc).isoformat(),
             "client": client,
             "domain": domain,
-            "reason": reason,   # "adult_domain" | "keyword"
+            "reason": reason,   # "adult_domain" | "keyword" | "bypass_attempt"
             "detail": detail,   # category or the matched keyword
+            "person": person,   # attribution when known (e.g. token endpoint)
         }
         try:
             if os.path.dirname(self.path):
@@ -1395,11 +1400,20 @@ class Accountability:
         self.enabled = bool(cfg.get("enabled", False))
         self.logger = logger
         self.dark_after_hours = float(cfg.get("dark_device_hours", 48))
+        # Public hostname devices use to reach this server's DoH/DoT endpoint
+        # (for per-device setup profiles), e.g. "dns.example.com".
+        self.base_domain = str(cfg.get("base_domain", "")).strip()
         self.people = [Person(p) for p in (cfg.get("people") or [])]
 
     def person_for(self, client_ip: str) -> Optional[Person]:
         for person in self.people:
             if client_ip in person.devices:
+                return person
+        return None
+
+    def by_name(self, name: str) -> Optional[Person]:
+        for person in self.people:
+            if person.name == name:
                 return person
         return None
 
@@ -1417,6 +1431,57 @@ class Accountability:
             streak += 1
             day -= datetime.timedelta(days=1)
         return streak
+
+
+class DeviceTokens:
+    """Stable per-person secret tokens for per-device DoH/DoT endpoints.
+
+    A token identifies a person regardless of the source IP, so a phone on
+    cellular that uses ``/p/<token>/dns-query`` still has its activity
+    attributed to that person's accountability report. Tokens are generated
+    once and persisted.
+    """
+
+    def __init__(self, path: str, logger: logging.Logger):
+        self.path = path
+        self.logger = logger
+        self._lock = threading.Lock()
+        self._by_person: Dict[str, str] = {}
+        try:
+            if path and os.path.exists(path):
+                with open(path, "r", encoding="utf-8") as f:
+                    self._by_person = json.load(f)
+        except (OSError, ValueError):
+            self._by_person = {}
+
+    def _save(self) -> None:
+        try:
+            if os.path.dirname(self.path):
+                os.makedirs(os.path.dirname(self.path), exist_ok=True)
+            with open(self.path, "w", encoding="utf-8") as f:
+                json.dump(self._by_person, f)
+            if os.name == "posix":
+                os.chmod(self.path, 0o600)
+        except OSError as exc:
+            self.logger.error("Could not persist device tokens: %s", exc)
+
+    def token_for(self, person_name: str) -> str:
+        with self._lock:
+            token = self._by_person.get(person_name)
+            if not token:
+                token = secrets.token_urlsafe(9)
+                self._by_person[person_name] = token
+                self._save()
+            return token
+
+    def person_for_token(self, token: str) -> Optional[str]:
+        if not token:
+            return None
+        with self._lock:
+            for name, tok in self._by_person.items():
+                if secrets.compare_digest(tok, token):
+                    return name
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -1871,6 +1936,9 @@ class FaithFilterResolver(BaseResolver):
         self.search_log = SearchLog(
             acct_cfg.get("search_log_file", "logs/searches.jsonl"), logger,
             keywords=self.keywords.keywords)
+        self.device_tokens = DeviceTokens(
+            acct_cfg.get("device_tokens_file", "logs/device_tokens.json"),
+            logger)
         self.blocklists.on_refresh_failure = self._refresh_failure_alert
         cache_cfg = config.get("dns", {}).get("cache", {})
         self.cache: Optional[DNSCache] = None
@@ -2007,25 +2075,29 @@ class FaithFilterResolver(BaseResolver):
         return reply
 
     def _record_alert(self, client_ip: str, domain: str,
-                      reason: str, detail: str) -> None:
+                      reason: str, detail: str,
+                      person: Optional["Person"] = None) -> None:
         self.stats["alerts"] += 1
-        self.alerts.add(client_ip, domain, reason, detail)
+        # Prefer an explicit identity (per-device token endpoint); fall back
+        # to the IP-based device lookup.
+        person = person or self.accountability.person_for(client_ip)
+        self.alerts.add(client_ip, domain, reason, detail,
+                        person=person.name if person else "")
         if (reason in ("adult_domain", "bypass_attempt")
                 and self.notifications.get("instant_alerts", True)):
             interval = float(self.notifications.get(
                 "instant_min_minutes", 60)) * 60
             kind = ("adult content" if reason == "adult_domain"
                     else "a filter-bypass service (VPN/proxy/DoH)")
-            label = self.client_label(client_ip)
+            label = person.name if person else self.client_label(client_ip)
             self.notifier.send_throttled(
-                f"instant:{client_ip}", interval,
+                f"instant:{label}", interval,
                 f"FaithFilter alert: {label} tried to reach {kind}",
                 f"Device {label} attempted to access {domain} "
                 f"({reason}: {detail}).\n\n"
                 "Further attempts from this device within the next hour are "
                 "throttled; the weekly report will contain the full list.")
             # Notify the person's accountability partners directly.
-            person = self.accountability.person_for(client_ip)
             if person and person.allies:
                 self.notifier.send_throttled(
                     f"ally:{person.name}:{reason}", interval,
@@ -2034,6 +2106,13 @@ class FaithFilterResolver(BaseResolver):
                     f"  {domain}\n\nThis is an automated accountability alert. "
                     "The full weekly report will follow.",
                     recipients=person.allies)
+
+    @staticmethod
+    def _servfail(request: DNSRecord) -> DNSRecord:
+        """SERVFAIL reply (dnslib's reply() takes no rcode argument)."""
+        reply = request.reply()
+        reply.header.rcode = RCODE.SERVFAIL
+        return reply
 
     def _cname_blocked(self, response: DNSRecord) -> Optional[str]:
         """Category if a CNAME in the response chains to a blocked domain
@@ -2057,6 +2136,10 @@ class FaithFilterResolver(BaseResolver):
         qname = str(request.q.qname).rstrip(".").lower()
         client_ip = (handler.client_address[0]
                      if hasattr(handler, "client_address") else "unknown")
+        # Per-device token/DoH endpoints attach a Person so activity is
+        # attributed to them even off the home network.
+        identity: Optional["Person"] = getattr(
+            handler, "faithfilter_identity", None)
         group = self.policies.group_for(client_ip)
         filtering = str(group.get("filtering", "full")).lower()
 
@@ -2076,7 +2159,7 @@ class FaithFilterResolver(BaseResolver):
         if filtering == "off":
             self.log_query(client_ip, qname, "allowed:unfiltered")
             resp = self._forward_cached(request)
-            return resp if resp else request.reply(rcode=RCODE.SERVFAIL)
+            return resp if resp else self._servfail(request)
 
         # 0b. DoH/Private-Relay canaries: NXDOMAIN keeps devices on this
         # resolver instead of tunnelling their DNS elsewhere.
@@ -2097,7 +2180,7 @@ class FaithFilterResolver(BaseResolver):
         if self.blocklists.is_whitelisted(qname):
             self.log_query(client_ip, qname, "whitelisted")
             resp = self._forward_cached(request)
-            return resp if resp else request.reply(rcode=RCODE.SERVFAIL)
+            return resp if resp else self._servfail(request)
 
         # 2. Safe-search / restricted-mode rewrites (per-group opt-out).
         if group.get("safe_search", True):
@@ -2112,9 +2195,11 @@ class FaithFilterResolver(BaseResolver):
         if category:
             if monitor:
                 if category == "adult":
-                    self._record_alert(client_ip, qname, "adult_domain", category)
+                    self._record_alert(client_ip, qname, "adult_domain",
+                                       category, person=identity)
                 elif category == "bypass":
-                    self._record_alert(client_ip, qname, "bypass_attempt", category)
+                    self._record_alert(client_ip, qname, "bypass_attempt",
+                                       category, person=identity)
             if enforce:
                 self.stats["blocked"] += 1
                 self.stats["blocked_" + category] = \
@@ -2127,7 +2212,8 @@ class FaithFilterResolver(BaseResolver):
         elif monitor:
             keyword = self.keywords.match(qname)
             if keyword:
-                self._record_alert(client_ip, qname, "keyword", keyword)
+                self._record_alert(client_ip, qname, "keyword", keyword,
+                                   person=identity)
                 if enforce and self.keywords.block_matches:
                     self.log_query(client_ip, qname, f"blocked:keyword:{keyword}")
                     self.stats["blocked"] += 1
@@ -2142,7 +2228,7 @@ class FaithFilterResolver(BaseResolver):
         # cloaked trackers before handing the answer back.
         resp = self._forward_cached(request)
         if resp is None:
-            return request.reply(rcode=RCODE.SERVFAIL)
+            return self._servfail(request)
         if enforce:
             cname_category = self._cname_blocked(resp)
             if cname_category:
@@ -2150,7 +2236,8 @@ class FaithFilterResolver(BaseResolver):
                 self.stats["blocked_cname"] += 1
                 if cname_category == "adult":
                     self._record_alert(client_ip, qname, "adult_domain",
-                                       f"cname:{cname_category}")
+                                       f"cname:{cname_category}",
+                                       person=identity)
                 self.log_query(client_ip, qname,
                                f"blocked:cname:{cname_category}")
                 return self._blocked_reply(request)
@@ -2436,7 +2523,11 @@ class Reporter:
         all_audit = res.audit.read_since(period_start)
         for person in res.accountability.people:
             devices = set(person.devices)
-            p_alerts = [a for a in all_alerts if a.get("client") in devices]
+            # Match by device IP or by attributed person name (the latter
+            # covers off-network devices using the person's token endpoint).
+            p_alerts = [a for a in all_alerts
+                        if a.get("client") in devices
+                        or a.get("person") == person.name]
             p_audit = [e for e in all_audit if e.get("client") in devices]
             p_search = res.search_log.read_since(period_start,
                                                  list(devices))
@@ -2637,7 +2728,11 @@ class BlockPageServer:
 
             def _page(self, message: str = "") -> None:
                 host = (self.headers.get("Host") or "this site").split(":")[0]
-                html = BLOCK_PAGE_HTML.format(domain=host, message=message)
+                # Escape the client-supplied Host header before reflecting it
+                # into the page (prevents reflected XSS). ``message`` is
+                # server-generated markup and is intentionally not escaped.
+                html = BLOCK_PAGE_HTML.format(
+                    domain=html_lib.escape(host), message=message)
                 body = html.encode("utf-8")
                 self.send_response(200)
                 self.send_header("Content-Type", "text/html; charset=utf-8")
@@ -2719,14 +2814,36 @@ class DoTServer:
             return False
         context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         context.load_cert_chain(self.cert_file, self.key_file)
+
+        def sni_callback(sslsock, server_name, ctx):
+            # Stash the requested hostname so we can attribute the connection
+            # to a person (per-person subdomain token.base_domain).
+            try:
+                sslsock.faithfilter_sni = server_name
+            except Exception:
+                pass
+
+        context.sni_callback = sni_callback
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         sock.bind(("0.0.0.0", self.port))
         sock.listen(16)
 
+        def identity_for_sni(server_name: Optional[str]):
+            """Map a per-person subdomain (token.base_domain) from the TLS
+            SNI to that Person, so Android Private DNS attributes correctly."""
+            if not server_name:
+                return None
+            label = server_name.split(".")[0]
+            name = self.resolver.device_tokens.person_for_token(label)
+            return self.resolver.accountability.by_name(name) if name else None
+
         def handle(conn: ssl.SSLSocket, addr) -> None:
+            person = identity_for_sni(getattr(conn, "faithfilter_sni", None))
+
             class FakeHandler:
                 client_address = addr
+                faithfilter_identity = person
             try:
                 conn.settimeout(30)
                 while not self._stop.is_set():
@@ -2851,6 +2968,8 @@ DASHBOARD_HTML = """<!DOCTYPE html><html><head><meta charset="utf-8">
 </section>
 <section style="grid-column:1/-1"><h2>Accountability</h2>
 <div id="people"></div>
+<h2 style="margin-top:.8rem">Set up a device (follows the person onto cellular)</h2>
+<div id="devices" style="font-size:.85rem"></div>
 <h2 style="margin-top:.8rem">Search terms (last 7 days)</h2>
 <table id="searches"><tbody></tbody></table>
 <h2 style="margin-top:.8rem">Filter change / tamper log</h2>
@@ -2969,6 +3088,21 @@ async function refresh(){
    esc((p.allies||[]).join(', '))+'</span></div>').join('')||
    '<span style="color:#64748b">No people configured. Add an '+
    '<b>accountability</b> section in config.yaml.</span>';
+  const dev=await (await fetch('/api/devices')).json();
+  if(!dev.base_domain){
+   $('devices').innerHTML='<span style="color:#64748b">Set '+
+    '<b>accountability.base_domain</b> (your server\\'s public DoH hostname) '+
+    'in config.yaml to generate per-device setup profiles.</span>';
+  }else{
+   $('devices').innerHTML=(dev.people||[]).map(d=>
+    '<div style="margin:.3rem 0;padding:.3rem 0;border-bottom:1px solid #eee">'+
+    '<b>'+esc(d.name)+'</b> &nbsp;'+
+    ['apple','android','windows','linux'].map(pl=>
+     '<a href="/api/devices/'+encodeURIComponent(d.name)+'/'+pl+
+     '" style="margin-right:.5rem">'+pl+'</a>').join('')+
+    '<br><span style="font-size:.7rem;color:#64748b">'+esc(d.doh_url)+
+    '</span></div>').join('')||'<span style="color:#64748b">No people yet.</span>';
+  }
   const se=await (await fetch('/api/searches?days=7')).json();
   $('searches').tBodies[0].innerHTML=se.slice(-30).reverse().map(s=>
    '<tr><td>'+esc(s.time.slice(0,16))+'</td><td>'+esc(nm(s.client))+
@@ -3033,6 +3167,187 @@ def get_admin_password(config: Dict, logger: logging.Logger) -> str:
         return secrets.token_urlsafe(9)
 
 
+# ---------------------------------------------------------------------------
+# Per-device setup profiles (Apple / Android / Windows / Linux)
+# ---------------------------------------------------------------------------
+
+def device_endpoints(base_domain: str, token: str) -> Dict[str, str]:
+    """Return the per-person endpoint strings for each platform.
+
+    ``base_domain`` is the public authority devices reach this server at,
+    e.g. ``dns.example.com`` (optionally ``host:port``).
+    """
+    base = base_domain.strip().rstrip("/")
+    return {
+        "doh_url": f"https://{base}/p/{token}/dns-query" if base else "",
+        # Android Private DNS / systemd-resolved use a hostname (DoT). A
+        # per-person subdomain requires wildcard DNS + cert; the plain base
+        # domain applies the whole-network policy.
+        "dot_person": f"{token}.{base.split(':')[0]}" if base else "",
+        "dot_network": base.split(":")[0] if base else "",
+    }
+
+
+APPLE_MOBILECONFIG = """<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" \
+"http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>PayloadContent</key>
+  <array>
+    <dict>
+      <key>Name</key><string>FaithFilter DNS</string>
+      <key>PayloadDescription</key>
+      <string>Encrypted DNS filtering for {person}</string>
+      <key>PayloadDisplayName</key><string>FaithFilter DNS ({person})</string>
+      <key>PayloadIdentifier</key>
+      <string>net.faithfilter.dns.{token}</string>
+      <key>PayloadType</key>
+      <string>com.apple.dnsSettings.managed</string>
+      <key>PayloadUUID</key><string>{payload_uuid}</string>
+      <key>PayloadVersion</key><integer>1</integer>
+      <key>DNSSettings</key>
+      <dict>
+        <key>DNSProtocol</key><string>HTTPS</string>
+        <key>ServerURL</key><string>{doh_url}</string>
+      </dict>
+      <key>ProhibitDisablement</key><{prohibit}/>
+    </dict>
+  </array>
+  <key>PayloadDisplayName</key><string>FaithFilter DNS ({person})</string>
+  <key>PayloadIdentifier</key><string>net.faithfilter.{token}</string>
+  <key>PayloadRemovalDisallowed</key><false/>
+  <key>PayloadType</key><string>Configuration</string>
+  <key>PayloadUUID</key><string>{profile_uuid}</string>
+  <key>PayloadVersion</key><integer>1</integer>
+</dict></plist>
+"""
+
+
+def build_apple_mobileconfig(person: str, doh_url: str, token: str,
+                             prohibit_disable: bool = False) -> str:
+    """An Apple .mobileconfig that sets encrypted (DoH) DNS on iOS/macOS."""
+    return APPLE_MOBILECONFIG.format(
+        person=html_lib.escape(person), token=html_lib.escape(token),
+        doh_url=html_lib.escape(doh_url),
+        prohibit="true" if prohibit_disable else "false",
+        payload_uuid=uuid.uuid5(uuid.NAMESPACE_URL, "ff-payload-" + token),
+        profile_uuid=uuid.uuid5(uuid.NAMESPACE_URL, "ff-profile-" + token))
+
+
+def build_android_card(person: str, endpoints: Dict[str, str]) -> str:
+    """Plain-text Android Private DNS setup instructions."""
+    host = endpoints["dot_person"] or endpoints["dot_network"] or \
+        "(set accountability.base_domain first)"
+    return (
+        f"FaithFilter — Android setup for {person}\n"
+        f"{'=' * 40}\n\n"
+        "Android filters DNS system-wide (Wi-Fi and cellular) via Private DNS:\n\n"
+        "  1. Settings -> Network & internet -> Private DNS\n"
+        "  2. Choose 'Private DNS provider hostname'\n"
+        f"  3. Enter:  {host}\n"
+        "  4. Save.\n\n"
+        "Lock it so it can't be changed: use Google Family Link on the\n"
+        "child's account to block changing network settings.\n\n"
+        "Note: the per-person hostname needs wildcard DNS + TLS on the\n"
+        "server; otherwise use the base domain (whole-network policy) and\n"
+        "install the browser extension for per-person search visibility.\n")
+
+
+WINDOWS_SETUP_PS1 = r"""# FaithFilter per-device setup for Windows 11 (encrypted DNS / DoH)
+# Personalized for: {person}
+# Run in an ELEVATED PowerShell:  Set-ExecutionPolicy -Scope Process Bypass; .\setup.ps1
+$ErrorActionPreference = "Stop"
+$DohTemplate = "{doh_url}"
+$ServerHost  = "{server_host}"
+
+Write-Host "Configuring FaithFilter encrypted DNS for {person}..."
+if (-not $DohTemplate -or -not $ServerHost) {{
+  Write-Error "This server has no public base_domain configured yet."
+  exit 1
+}}
+# Resolve the server's IP (Windows maps DoH templates to a server IP).
+$ip = (Resolve-DnsName -Name $ServerHost -Type A -ErrorAction Stop |
+       Select-Object -First 1 -ExpandProperty IPAddress)
+Write-Host "Server $ServerHost -> $ip"
+# Register the DoH template for that IP and require encryption.
+netsh dns add encryption server=$ip dohtemplate=$DohTemplate autoupgrade=yes udpfallback=no | Out-Null
+# Point every active adapter at it.
+Get-DnsClientServerAddress -AddressFamily IPv4 |
+  Where-Object {{ $_.ServerAddresses }} |
+  ForEach-Object {{ Set-DnsClientServerAddress -InterfaceIndex $_.InterfaceIndex -ServerAddresses $ip }}
+Clear-DnsClientCache
+Write-Host "Done. All DNS now goes to FaithFilter over HTTPS."
+Write-Host "To lock it, use a Standard (non-admin) child account so system DNS can't be changed."
+"""
+
+
+def build_windows_ps1(person: str, endpoints: Dict[str, str]) -> str:
+    return WINDOWS_SETUP_PS1.format(
+        person=person.replace('"', "'"), doh_url=endpoints["doh_url"],
+        server_host=endpoints["dot_network"])
+
+
+LINUX_SETUP_SH = r"""#!/usr/bin/env bash
+# FaithFilter per-device setup for Linux (systemd-resolved, DNS-over-TLS)
+# Personalized for: {person}
+# Run with sudo:  sudo ./setup-faithfilter.sh
+set -euo pipefail
+DOT_HOST="{dot_host}"
+if [ -z "$DOT_HOST" ]; then
+  echo "This server has no public base_domain configured yet." >&2
+  exit 1
+fi
+IP="$(getent hosts "$DOT_HOST" | awk '{{print $1}}' | head -n1)"
+if [ -z "$IP" ]; then echo "Could not resolve $DOT_HOST" >&2; exit 1; fi
+echo "Configuring systemd-resolved DoT to $DOT_HOST ($IP) for {person}..."
+mkdir -p /etc/systemd/resolved.conf.d
+cat > /etc/systemd/resolved.conf.d/faithfilter.conf <<EOF
+[Resolve]
+DNS=$IP#$DOT_HOST
+DNSOverTLS=yes
+Domains=~.
+EOF
+systemctl restart systemd-resolved
+echo "Done. All DNS now goes to FaithFilter over TLS."
+echo "Lock it by restricting sudo/root on this account."
+"""
+
+
+def build_linux_sh(person: str, endpoints: Dict[str, str]) -> str:
+    host = endpoints["dot_person"] or endpoints["dot_network"]
+    return LINUX_SETUP_SH.format(person=person.replace('"', "'"),
+                                 dot_host=host)
+
+
+DEVICE_PLATFORMS = {
+    "apple": ("faithfilter-{token}.mobileconfig",
+              "application/x-apple-aspen-config"),
+    "android": ("faithfilter-{token}-android.txt", "text/plain"),
+    "windows": ("faithfilter-{token}-setup.ps1", "text/plain"),
+    "linux": ("faithfilter-{token}-setup.sh", "text/plain"),
+}
+
+
+def build_device_profile(platform: str, person: str, token: str,
+                         base_domain: str,
+                         prohibit_disable: bool = False):
+    """Return (filename, mimetype, body) for a person+platform, or None."""
+    if platform not in DEVICE_PLATFORMS:
+        return None
+    endpoints = device_endpoints(base_domain, token)
+    if platform == "apple":
+        body = build_apple_mobileconfig(person, endpoints["doh_url"], token,
+                                        prohibit_disable)
+    elif platform == "android":
+        body = build_android_card(person, endpoints)
+    elif platform == "windows":
+        body = build_windows_ps1(person, endpoints)
+    else:
+        body = build_linux_sh(person, endpoints)
+    filename, mimetype = DEVICE_PLATFORMS[platform]
+    return filename.format(token=token), mimetype, body
+
+
 def create_api_server(resolver: FaithFilterResolver, reporter: Reporter,
                       config: Dict,
                       block_page: Optional[BlockPageServer] = None,
@@ -3045,6 +3360,15 @@ def create_api_server(resolver: FaithFilterResolver, reporter: Reporter,
     admin_password = get_admin_password(config, logger)
     app.secret_key = hashlib.sha256(
         ("faithfilter:" + admin_password).encode()).digest()
+    # Harden the session cookie. Secure is set only when the dashboard is
+    # served over HTTPS, so cookies still work on a plain-HTTP LAN install.
+    app.config.update(
+        SESSION_COOKIE_HTTPONLY=True,
+        SESSION_COOKIE_SAMESITE="Lax",
+        SESSION_COOKIE_SECURE=bool(api_cfg.get("cert_file")
+                                   and api_cfg.get("key_file")),
+        MAX_CONTENT_LENGTH=2 * 1024 * 1024,  # cap request bodies
+    )
     doh_enabled = bool(api_cfg.get("doh", True))
 
     # The extension endpoint authenticates with its own shared key, so it
@@ -3058,7 +3382,14 @@ def create_api_server(resolver: FaithFilterResolver, reporter: Reporter,
     def check_auth():
         if request.path in OPEN_PATHS:
             return None
-        if api_key and request.headers.get("X-API-Key") == api_key:
+        # Per-person DoH endpoints (/p/<token>/dns-query) authenticate with
+        # the token in the path, so they bypass the dashboard login.
+        if request.path.startswith("/p/") and request.path.endswith(
+                "/dns-query"):
+            return None
+        supplied_key = request.headers.get("X-API-Key")
+        if api_key and supplied_key and secrets.compare_digest(
+                supplied_key, api_key):
             return None
         if session.get("authed"):
             return None
@@ -3086,28 +3417,45 @@ def create_api_server(resolver: FaithFilterResolver, reporter: Reporter,
     def dashboard():
         return DASHBOARD_HTML
 
+    def _serve_doh(identity_person=None):
+        """Shared RFC 8484 DoH handler; identity_person attributes the query
+        to a specific person (per-device token endpoints)."""
+        try:
+            if request.method == "GET":
+                encoded = request.args.get("dns", "")
+                padding = "=" * (-len(encoded) % 4)
+                wire = base64.urlsafe_b64decode(encoded + padding)
+            else:
+                wire = request.get_data()
+            record = DNSRecord.parse(wire)
+        except Exception:
+            return jsonify({"error": "invalid DNS message"}), 400
+
+        class FakeHandler:
+            client_address = (request.remote_addr or "unknown", 0)
+            faithfilter_identity = identity_person
+
+        reply = resolver.resolve(record, FakeHandler())
+        # dnslib's pack() returns a bytearray; WSGI requires bytes.
+        return Response(bytes(reply.pack()),
+                        content_type="application/dns-message")
+
     if doh_enabled:
         @app.route("/dns-query", methods=["GET", "POST"])
         def dns_query():
-            """RFC 8484 DNS-over-HTTPS endpoint."""
-            try:
-                if request.method == "GET":
-                    encoded = request.args.get("dns", "")
-                    padding = "=" * (-len(encoded) % 4)
-                    wire = base64.urlsafe_b64decode(encoded + padding)
-                else:
-                    wire = request.get_data()
-                record = DNSRecord.parse(wire)
-            except Exception:
-                return jsonify({"error": "invalid DNS message"}), 400
+            """RFC 8484 DNS-over-HTTPS endpoint (whole-network)."""
+            return _serve_doh()
 
-            class FakeHandler:
-                client_address = (request.remote_addr or "unknown", 0)
-
-            reply = resolver.resolve(record, FakeHandler())
-            # dnslib's pack() returns a bytearray; WSGI requires bytes.
-            return Response(bytes(reply.pack()),
-                            content_type="application/dns-message")
+        @app.route("/p/<token>/dns-query", methods=["GET", "POST"])
+        def dns_query_person(token):
+            """Per-person DoH endpoint: the token identifies whose device
+            this is, so a phone on cellular is still filtered and its
+            activity attributed to that person's accountability report."""
+            name = resolver.device_tokens.person_for_token(token)
+            person = resolver.accountability.by_name(name) if name else None
+            if person is None:
+                return jsonify({"error": "unknown device token"}), 404
+            return _serve_doh(person)
 
     @app.route("/api/extension/events", methods=["POST"])
     def extension_events():
@@ -3118,7 +3466,12 @@ def create_api_server(resolver: FaithFilterResolver, reporter: Reporter,
         """
         if not extension_cfg.get("enabled", False):
             return jsonify({"error": "extension reporting disabled"}), 403
-        if extension_key and request.headers.get("X-Extension-Key") != extension_key:
+        # A key is mandatory when the endpoint is enabled, so it can never be
+        # left open to unauthenticated writes.
+        if not extension_key:
+            return jsonify({"error": "server has no extension key set"}), 503
+        supplied = request.headers.get("X-Extension-Key") or ""
+        if not secrets.compare_digest(supplied, extension_key):
             return jsonify({"error": "invalid extension key"}), 401
         data = request.get_json(silent=True) or {}
         events = data.get("events") or []
@@ -3153,6 +3506,44 @@ def create_api_server(resolver: FaithFilterResolver, reporter: Reporter,
                                  datetime.datetime.now(datetime.timezone.utc)
                                  - datetime.timedelta(days=400)))})
         return jsonify(rows)
+
+    @app.route("/api/devices")
+    def devices_route():
+        """People with their per-device endpoints, for the setup page."""
+        base_domain = resolver.accountability.base_domain
+        rows = []
+        for person in resolver.accountability.people:
+            token = resolver.device_tokens.token_for(person.name)
+            endpoints = device_endpoints(base_domain, token)
+            rows.append({
+                "name": person.name,
+                "configured": bool(base_domain),
+                "doh_url": endpoints["doh_url"],
+                "dot_hostname": endpoints["dot_person"] or endpoints["dot_network"],
+                "platforms": list(DEVICE_PLATFORMS.keys()),
+            })
+        return jsonify({"base_domain": base_domain, "people": rows})
+
+    @app.route("/api/devices/<person>/<platform>")
+    def device_profile(person, platform):
+        p = resolver.accountability.by_name(person)
+        if p is None:
+            return jsonify({"error": "unknown person"}), 404
+        base_domain = resolver.accountability.base_domain
+        if not base_domain:
+            return jsonify({"error": "set accountability.base_domain first"}), 400
+        token = resolver.device_tokens.token_for(p.name)
+        prohibit = bool(request.args.get("lock"))
+        built = build_device_profile(platform, p.name, token, base_domain,
+                                     prohibit)
+        if built is None:
+            return jsonify({"error": "unknown platform"}), 404
+        filename, mimetype, body = built
+        resolver.audit.add("device_profile",
+                           f"{platform} profile generated for {p.name}",
+                           actor="dashboard")
+        return Response(body, mimetype=mimetype, headers={
+            "Content-Disposition": f'attachment; filename="{filename}"'})
 
     @app.route("/api/audit")
     def audit_route():
@@ -3703,13 +4094,18 @@ def main() -> None:
                                     block_page, logger, updates)
             host = config.get("http_api", {}).get("host", "127.0.0.1")
             port = int(config.get("http_api", {}).get("port", 5000))
-            run_kwargs: Dict = {"host": host, "port": port}
+            run_kwargs: Dict = {"host": host, "port": port,
+                                "threaded": True}
             cert = config.get("http_api", {}).get("cert_file")
             key = config.get("http_api", {}).get("key_file")
             if cert and key:
                 run_kwargs["ssl_context"] = (cert, key)
             threading.Thread(target=app.run, kwargs=run_kwargs,
                              daemon=True).start()
+            if host == "0.0.0.0" and not (cert and key):
+                logger.warning("Dashboard is reachable across the LAN (host "
+                               "0.0.0.0) over plain HTTP; set cert_file/"
+                               "key_file for HTTPS, or bind host to 127.0.0.1.")
             logger.info("FaithFilter dashboard/API listening on %s:%s%s",
                         host, port, " (HTTPS)" if cert and key else "")
 

@@ -205,6 +205,14 @@ accountability:
   audit_log_file: "logs/audit.jsonl"       # filter-change / tamper history
   search_log_file: "logs/searches.jsonl"   # search terms from the extension
 
+  # Public hostname this server is reachable at for per-device setup
+  # profiles (phones/laptops that follow the filter onto cellular). Needs a
+  # real TLS certificate (see http_api.cert_file / dot.*). When set, the
+  # dashboard's "Set up a device" generates Apple/Android/Windows/Linux
+  # profiles per person, each using https://<base_domain>/p/<token>/dns-query.
+  base_domain: ""            # e.g. "dns.yourfamily.net"
+  device_tokens_file: "logs/device_tokens.json"   # stable per-person tokens
+
 # -----------------------------------------------------------------------------
 # Browser extension (optional): search terms & visited sites DNS can't see
 # -----------------------------------------------------------------------------

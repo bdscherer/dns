@@ -1,0 +1,27 @@
+FaithFilter — a self-hosted DNS content filter and accountability tool
+Copyright (C) 2026 Brandon Scherer
+
+This program is free software: you can redistribute it and/or modify it
+under the terms of the GNU Affero General Public License as published by
+the Free Software Foundation, either version 3 of the License, or (at your
+option) any later version.
+
+This program is distributed in the hope that it will be useful, but WITHOUT
+ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Affero General Public License
+for more details.
+
+You should have received a copy of the GNU Affero General Public License
+along with this program (see the LICENSE file). If not, see
+<https://www.gnu.org/licenses/>.
+
+------------------------------------------------------------------------
+
+Why AGPL-3.0
+
+FaithFilter is released under the AGPL so it stays free and open for every
+family, school and community that wants to run it — and so that anyone who
+offers it as a hosted service must share their improvements back. The
+copyright holder may additionally offer the software under separate terms
+(for example, to operate a hosted version); the AGPL applies to this public
+distribution.
