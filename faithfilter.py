@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: AGPL-3.0-or-later
 """
 FaithFilter DNS filtering service
 ---------------------------------
@@ -35,6 +36,7 @@ import copy
 import datetime
 import fnmatch
 import getpass
+import html as html_lib
 import hashlib
 import io
 import ipaddress
@@ -2637,7 +2639,11 @@ class BlockPageServer:
 
             def _page(self, message: str = "") -> None:
                 host = (self.headers.get("Host") or "this site").split(":")[0]
-                html = BLOCK_PAGE_HTML.format(domain=host, message=message)
+                # Escape the client-supplied Host header before reflecting it
+                # into the page (prevents reflected XSS). ``message`` is
+                # server-generated markup and is intentionally not escaped.
+                html = BLOCK_PAGE_HTML.format(
+                    domain=html_lib.escape(host), message=message)
                 body = html.encode("utf-8")
                 self.send_response(200)
                 self.send_header("Content-Type", "text/html; charset=utf-8")
@@ -3045,6 +3051,15 @@ def create_api_server(resolver: FaithFilterResolver, reporter: Reporter,
     admin_password = get_admin_password(config, logger)
     app.secret_key = hashlib.sha256(
         ("faithfilter:" + admin_password).encode()).digest()
+    # Harden the session cookie. Secure is set only when the dashboard is
+    # served over HTTPS, so cookies still work on a plain-HTTP LAN install.
+    app.config.update(
+        SESSION_COOKIE_HTTPONLY=True,
+        SESSION_COOKIE_SAMESITE="Lax",
+        SESSION_COOKIE_SECURE=bool(api_cfg.get("cert_file")
+                                   and api_cfg.get("key_file")),
+        MAX_CONTENT_LENGTH=2 * 1024 * 1024,  # cap request bodies
+    )
     doh_enabled = bool(api_cfg.get("doh", True))
 
     # The extension endpoint authenticates with its own shared key, so it
@@ -3058,7 +3073,9 @@ def create_api_server(resolver: FaithFilterResolver, reporter: Reporter,
     def check_auth():
         if request.path in OPEN_PATHS:
             return None
-        if api_key and request.headers.get("X-API-Key") == api_key:
+        supplied_key = request.headers.get("X-API-Key")
+        if api_key and supplied_key and secrets.compare_digest(
+                supplied_key, api_key):
             return None
         if session.get("authed"):
             return None
@@ -3118,7 +3135,12 @@ def create_api_server(resolver: FaithFilterResolver, reporter: Reporter,
         """
         if not extension_cfg.get("enabled", False):
             return jsonify({"error": "extension reporting disabled"}), 403
-        if extension_key and request.headers.get("X-Extension-Key") != extension_key:
+        # A key is mandatory when the endpoint is enabled, so it can never be
+        # left open to unauthenticated writes.
+        if not extension_key:
+            return jsonify({"error": "server has no extension key set"}), 503
+        supplied = request.headers.get("X-Extension-Key") or ""
+        if not secrets.compare_digest(supplied, extension_key):
             return jsonify({"error": "invalid extension key"}), 401
         data = request.get_json(silent=True) or {}
         events = data.get("events") or []
@@ -3703,13 +3725,18 @@ def main() -> None:
                                     block_page, logger, updates)
             host = config.get("http_api", {}).get("host", "127.0.0.1")
             port = int(config.get("http_api", {}).get("port", 5000))
-            run_kwargs: Dict = {"host": host, "port": port}
+            run_kwargs: Dict = {"host": host, "port": port,
+                                "threaded": True}
             cert = config.get("http_api", {}).get("cert_file")
             key = config.get("http_api", {}).get("key_file")
             if cert and key:
                 run_kwargs["ssl_context"] = (cert, key)
             threading.Thread(target=app.run, kwargs=run_kwargs,
                              daemon=True).start()
+            if host == "0.0.0.0" and not (cert and key):
+                logger.warning("Dashboard is reachable across the LAN (host "
+                               "0.0.0.0) over plain HTTP; set cert_file/"
+                               "key_file for HTTPS, or bind host to 127.0.0.1.")
             logger.info("FaithFilter dashboard/API listening on %s:%s%s",
                         host, port, " (HTTPS)" if cert and key else "")
 

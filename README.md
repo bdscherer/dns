@@ -1,5 +1,41 @@
 # FaithFilter
 
+[![License: AGPL v3](https://img.shields.io/badge/License-AGPL_v3-blue.svg)](LICENSE)
+
+**Free, open-source, self-hosted content filtering and accountability for
+families, schools and small organisations — your data never leaves your
+network.** Point your router (or individual devices) at it as their DNS
+server and it blocks adult content, ads and trackers, enforces safe search,
+and gives a chosen accountability partner an honest picture — with no
+device slowdown, no subscription, and nothing phoning home.
+
+## Which install is for me?
+
+| You have… | Use | Start here |
+|---|---|---|
+| A **Windows PC** to run it on | `faithfilter-gui.exe` — a normal app, no console | [Windows Control Panel](#windows-the-control-panel-recommended) |
+| A **Raspberry Pi / Linux box** | the `faithfilter` binary or Python | [Quick start](#quick-start) |
+| A spare **Pi as a backup** DNS | follower sync as DNS 2 | [Second server](#second-server-on-a-raspberry-pi-no-single-point-of-failure) |
+| Only **phones/laptops**, no server | per-device setup | [`docs/PER_DEVICE.md`](docs/PER_DEVICE.md) |
+
+Grab prebuilt executables from the **[Releases](https://github.com/bdscherer/dns/releases)**
+page (Windows, Linux x64, Raspberry Pi ARM64) — no Python needed.
+
+## What it can and can't do (read this first)
+
+DNS filtering is powerful and invisible to devices, but it has honest
+limits. It **can**: block domains network-wide, force SafeSearch/YouTube
+restricted mode, detect and block VPN/proxy/DoH bypass attempts, and report
+activity per device. It **cannot**: see content *inside* an allowed site
+(NSFW on Reddit/Discord, etc. — safe-search enforcement is the lever there),
+see search terms without the optional browser extension, or filter a device
+on **cellular data** or one using a hardcoded resolver. It is strongest as
+part of a layered approach (DNS + router firewall rules + device Screen
+Time/Family Link). See [`docs/PER_DEVICE.md`](docs/PER_DEVICE.md) for
+per-device coverage and [SECURITY.md](SECURITY.md) for safe operation.
+
+---
+
 FaithFilter is a self-hosted DNS filtering service for families, schools and
 small organisations. Point your router (or individual devices) at it as
 their DNS server and it will:
@@ -546,3 +582,17 @@ faithfilter.exe --install-service        # Windows (admin): boot-time Scheduled 
 - Serving DoH/DoT to phones outside your network requires a public
   hostname with a real TLS certificate (e.g. Let's Encrypt) and forwarding
   the relevant ports; keep the dashboard itself off the public internet.
+
+## Contributing & security
+
+Contributions are welcome — see [CONTRIBUTING.md](CONTRIBUTING.md). Please
+report security issues privately via [SECURITY.md](SECURITY.md), not public
+issues.
+
+## License
+
+FaithFilter is free software licensed under the **GNU Affero General Public
+License v3.0** ([LICENSE](LICENSE)). You may run, study, share and improve
+it. If you offer it to others as a network service, the AGPL requires you to
+make your modified source available to those users. See [NOTICE](NOTICE) for
+the rationale.

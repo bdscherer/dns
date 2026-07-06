@@ -8,6 +8,7 @@ internet access is needed:
 """
 
 import datetime
+import http.client
 import json
 import logging
 import os
@@ -512,6 +513,69 @@ class AccountabilityTests(unittest.TestCase):
         self.assertIn("bad-porn.example", text)
         self.assertIn("bad stuff", text)
         self.assertIn("override_pause", text)
+
+
+class SecurityTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp)
+
+    def path(self, name):
+        return os.path.join(self.tmp, name)
+
+    def _app(self, extension):
+        config = {
+            "dns": {"upstream_dns": []},
+            "blocking": {"my_blocklist": self.path("b.txt"),
+                         "whitelist": self.path("w.txt"),
+                         "cache_dir": self.path("c"), "sources": []},
+            "monitoring": {"alert_log_file": self.path("a.jsonl")},
+            "accountability": {"audit_log_file": self.path("au.jsonl"),
+                               "search_log_file": self.path("s.jsonl")},
+            "clients": {"overrides_file": self.path("ov.json")},
+            "stats": {"db_file": self.path("st.db")},
+            "logs": {"query_log_file": None},
+            "extension": extension,
+            "http_api": {"password": "pw",
+                         "password_file": self.path("pwf.txt")},
+        }
+        resolver = FaithFilterResolver(config, LOGGER)
+        reporter = Reporter(config, resolver.alerts, LOGGER, resolver=resolver)
+        return create_api_server(resolver, reporter, config, None, LOGGER)
+
+    def test_extension_key_mandatory_when_enabled(self):
+        client = self._app({"enabled": True, "key": ""}).test_client()
+        resp = client.post("/api/extension/events",
+                           headers={"X-Extension-Key": "anything"},
+                           json={"events": []})
+        self.assertEqual(resp.status_code, 503)
+
+    def test_extension_wrong_key_rejected(self):
+        client = self._app({"enabled": True, "key": "right"}).test_client()
+        self.assertEqual(client.post(
+            "/api/extension/events", headers={"X-Extension-Key": "wrong"},
+            json={"events": []}).status_code, 401)
+        self.assertEqual(client.post(
+            "/api/extension/events", headers={"X-Extension-Key": "right"},
+            json={"events": []}).status_code, 200)
+
+    def test_block_page_escapes_host_header(self):
+        cfg = {"block_page": {"port": 18080,
+                              "unblock_requests_file": self.path("u.jsonl")}}
+        server = faithfilter.BlockPageServer(cfg, Notifier({}, LOGGER), LOGGER)
+        server.start()
+        try:
+            conn = http.client.HTTPConnection("127.0.0.1", 18080, timeout=5)
+            conn.request("GET", "/", headers={
+                "Host": "<script>alert(1)</script>"})
+            body = conn.getresponse().read().decode()
+            conn.close()
+            self.assertNotIn("<script>alert(1)</script>", body)
+            self.assertIn("&lt;script&gt;", body)
+        finally:
+            server.stop()
 
 
 class EndToEndTests(unittest.TestCase):
